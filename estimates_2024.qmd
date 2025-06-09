@@ -1,0 +1,148 @@
+---
+title: "2024 Jobs Estimates"
+format: html
+params:
+    est_year: 2024
+---
+
+# Overview
+
+This document is for producing the `{r} params$est_year` Colorado Jobs Estimates from the Colorado State Demography Office ("SDO").
+
+## Changes
+
+The methodology utilized by the SDO in its 2024 estimates program has been significantly revised for multiple reasons, including:
+
+### BLS Data Availability
+
+Changes in BLS (Bureau of Labor Statistics) data availability require a new primary source of certain employment and income data. In particular, industry specific data is no longer available, and because of this the SDO has decided to instead use the Quarterly Census of Employment and Wages (QCEW) and Current Employment Statistics (CES) data as the primary source of employment and income data. This simplifies the analysis and allows for more consistent data across industries.
+
+Additionally the availability of income data has changed from what has historically been available from the BLS. Additional sources of income data instead must be relied upon. The new methodology is outlined in the Base Industry section below.
+
+### Employment Sources and Industry Classification
+
+In order to simplify the methodology and allow for consistency with other data sources the SDO has decided to use the North American Industry Classification System (NAICS) as the primary industry classification system. This allows for consistency with other data sources and simplifies the analysis. Additionally, the SDO has decided to use the public versions of the QCEW and CES data, rather than relying on the microdata at this time, to again simplify the process. If significant fidelity is lost in the new methodology, the SDO may consider using the microdata in the future.
+
+## Loading Data and Packages
+
+```{r}
+library(tidyverse)
+library(keyring)
+library(DBI)
+library(RPostgres)
+library(duckdb)
+library(dbplyr)
+library(furrr)
+```
+
+Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials^[See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`]. The `duckdb` package is used to create a local DuckDB database for processing the data.
+
+```{r}
+#| label: connect_to_db
+# connect to SDO Postgres database
+con_pgsdo <- DBI::dbConnect(
+  RPostgres::Postgres(),
+  dbname = 'dola',
+  host = '104.197.26.248',
+  port = 5433,
+  user = "codemog",
+  password = keyring::key_get("pgsdo", "codemog")
+)
+dbListTables(con_pgsdo)
+
+# create crosswalks list
+crosswalks <- list()
+
+# store crosswalk_region
+crosswalks$region <- tbl(con_pgsdo, sql("SELECT * FROM econ.crosswalk_region")) %>%
+  collect()
+```
+
+# Total Estimated Jobs
+
+The first step in the process is to estimate the total number of jobs in Colorado for the year `{r params$est_year}`. This is done using the QCEW and CES data, which provides a comprehensive view of employment in the state. Additionally, an estimate of the total number of sole proprietors is derived using the U.S. Census Bureau's Nonemployer Statistics (NES) data, which provides an estimate of the number of sole proprietors in the state.
+
+## QCEW
+
+First QCEW data is downloaded and processed for all years. QCEW data is accessed using the [BLS QCEW CSV Data Slices](https://www.bls.gov/cew/additional-resources/open-data/csv-data-slices.htm) system for accessing CSVs. Data can be downloaded as CSV files using the URL format https://data.bls.gov/cew/data/api/{YEAR}/{QTR}/area/{FIPS5}.csv, where `{YEAR}` is the year of the analysis, starting in 1990 to current, `{QTR}` is `1-4` for a given quarter, or `a` for annual average, and `{FIPS5}` is the 5 digit state plus county FIPS code.
+https://data.bls.gov/cew/data/files/2024/csv/2024_annual_by_area.zip
+```{r}
+#| label: download_qcew
+
+# download QCEW data for all years
+# create list of download URLs
+download_urls <- paste0(
+  "https://data.bls.gov/cew/data/files/",
+  1990:params$est_year,
+  "/csv/",
+  1990:params$est_year,
+  "_annual_by_area.zip"
+)
+
+# create list of destination files
+dest_files <- paste0(
+  "data/qcew_raw/zip/",
+  1990:params$est_year,
+  "_annual_by_area.zip"
+)
+
+# filter out files that already exist
+download_urls <- download_urls[file.exists(dest_files) == FALSE]
+
+download.file(download_urls, dest_files, method = "libcurl")
+
+```
+
+``` {r}
+#| label: unzip_qcew
+
+zip_list <- list.files("data/qcew_raw/zip", full.names = TRUE)
+
+zip_file_list <- map(zip_list, function(zip_file) {
+  file_list <- unzip(zip_file, list = TRUE) |> 
+    filter(str_detect(Name, "Colorado")) |> 
+    pull(Name)
+
+
+  unzip(zip_file, files = file_list, exdir = "data/qcew_raw/csv", overwrite = FALSE, junkpaths = TRUE)
+})
+
+```
+
+```{r}
+#| label: process_qcew
+
+# read file layout from qcew documentation
+qcew_layout <- read_csv(
+  "https://www.bls.gov/cew/about-data/downloadable-file-layouts/annual/naics-based-annual-layout-csv.csv"
+) |>
+  mutate(
+    duckdb_type = case_when(
+      data_type == "Text" ~ "VARCHAR",
+      data_type == "Date" ~ "DATE",
+      data_type == "Numeric" ~ "DOUBLE",
+      TRUE ~ "VARCHAR"
+    )
+  )
+
+# create a duckdb database of all QCEW data
+con_qcew <- dbConnect(duckdb::duckdb(), "data/qcew_raw/qcew.duckdb")
+# read all files into single table
+qcew_files <- list.files("data/qcew_raw/csv", full.names = TRUE)
+
+# commented out to avoid overwriting existing table
+# dbRemoveTable(con_qcew, "qcew") # remove table if it exists
+
+# qcew_db <- duckdb_read_csv(
+#   con_qcew,
+#   name = "qcew",
+#   qcew_files,
+#     col.names = qcew_layout$field_name,
+#     col.types = qcew_layout$duckdb_type
+# )
+
+# create a table of all qcew data
+qcew <- tbl(con_qcew, "qcew") |> 
+    collect()
+qcew
+```

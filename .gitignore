@@ -1,0 +1,7 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/qcew_raw/zip
+data/qcew_raw/csv
+*.duckdb
