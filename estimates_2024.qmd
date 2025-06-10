@@ -32,10 +32,10 @@ library(DBI)
 library(RPostgres)
 library(duckdb)
 library(dbplyr)
-library(furrr)
+library(censusapi)
 ```
 
-Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials^[See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`]. The `duckdb` package is used to create a local DuckDB database for processing the data.
+Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials^[See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`]. The `duckdb` package is used to create a local DuckDB database for processing the data stored as `data/qcew.duckdb`.
 
 ```{r}
 #| label: connect_to_db
@@ -48,13 +48,28 @@ con_pgsdo <- DBI::dbConnect(
   user = "codemog",
   password = keyring::key_get("pgsdo", "codemog")
 )
+
+# Connect to duckdb database of all QCEW data
+con_qcew <- dbConnect(duckdb::duckdb(), "data/qcew.duckdb")
+
+# Optional - use connections for browsing database in compatabile IDE (e.g., RStudio/Positron)
+connections::connection_view(con_pgsdo)
+connections::connection_view(con_qcew)
+```
+
+```{r}
+#| label: load_crosswalks
+
 dbListTables(con_pgsdo)
 
 # create crosswalks list
 crosswalks <- list()
 
 # store crosswalk_region
-crosswalks$region <- tbl(con_pgsdo, sql("SELECT * FROM econ.crosswalk_region")) %>%
+crosswalks$region <- tbl(
+  con_pgsdo,
+  sql("SELECT * FROM econ.crosswalk_region")
+) %>%
   collect()
 ```
 
@@ -64,85 +79,126 @@ The first step in the process is to estimate the total number of jobs in Colorad
 
 ## QCEW
 
-First QCEW data is downloaded and processed for all years. QCEW data is accessed using the [BLS QCEW CSV Data Slices](https://www.bls.gov/cew/additional-resources/open-data/csv-data-slices.htm) system for accessing CSVs. Data can be downloaded as CSV files using the URL format https://data.bls.gov/cew/data/api/{YEAR}/{QTR}/area/{FIPS5}.csv, where `{YEAR}` is the year of the analysis, starting in 1990 to current, `{QTR}` is `1-4` for a given quarter, or `a` for annual average, and `{FIPS5}` is the 5 digit state plus county FIPS code.
-https://data.bls.gov/cew/data/files/2024/csv/2024_annual_by_area.zip
-```{r}
-#| label: download_qcew
-
-# download QCEW data for all years
-# create list of download URLs
-download_urls <- paste0(
-  "https://data.bls.gov/cew/data/files/",
-  1990:params$est_year,
-  "/csv/",
-  1990:params$est_year,
-  "_annual_by_area.zip"
-)
-
-# create list of destination files
-dest_files <- paste0(
-  "data/qcew_raw/zip/",
-  1990:params$est_year,
-  "_annual_by_area.zip"
-)
-
-# filter out files that already exist
-download_urls <- download_urls[file.exists(dest_files) == FALSE]
-
-download.file(download_urls, dest_files, method = "libcurl")
-
-```
-
-``` {r}
-#| label: unzip_qcew
-
-zip_list <- list.files("data/qcew_raw/zip", full.names = TRUE)
-
-zip_file_list <- map(zip_list, function(zip_file) {
-  file_list <- unzip(zip_file, list = TRUE) |> 
-    filter(str_detect(Name, "Colorado")) |> 
-    pull(Name)
-
-
-  unzip(zip_file, files = file_list, exdir = "data/qcew_raw/csv", overwrite = FALSE, junkpaths = TRUE)
-})
-
-```
+First QCEW data is downloaded and processed for all years. QCEW data is accessed using the [BLS QCEW CSV Data Slices](https://www.bls.gov/cew/additional-resources/open-data/csv-data-slices.htm) system for accessing CSVs. Data can be downloaded as CSV files using the URL format https://data.bls.gov/cew/data/api/{YEAR}/{QTR}/area/{FIPS5}.csv, where `{YEAR}` is the year of the analysis, starting in 1990 to current, `{QTR}` is `1-4` for a given quarter, or `a` for annual average, and `{FIPS5}` is the 5 digit state plus county FIPS code. A script is provided to download and process the QCEW data for all years, and is available in `r_scripts/process_qcew.R`. The script downloads the data, processes it, and stores it in a DuckDB database `data/qcew.duckdb` for further analysis. Since the process is time consuming, the script is not run in this document, but is available for reference. A Google Drive folder is used for backing up date including both the [raw data](https://drive.google.com/open?id=1xNJTL7PMTY0wDlIUqWh3eE931s62vbh2&usp=drive_fs), and the [processed DuckDB database]().
 
 ```{r}
 #| label: process_qcew
 
-# read file layout from qcew documentation
-qcew_layout <- read_csv(
-  "https://www.bls.gov/cew/about-data/downloadable-file-layouts/annual/naics-based-annual-layout-csv.csv"
-) |>
-  mutate(
-    duckdb_type = case_when(
-      data_type == "Text" ~ "VARCHAR",
-      data_type == "Date" ~ "DATE",
-      data_type == "Numeric" ~ "DOUBLE",
-      TRUE ~ "VARCHAR"
-    )
-  )
+# source the processing script (uncomment to source)
+# source("r_scripts/process_qcew.R")
 
-# create a duckdb database of all QCEW data
-con_qcew <- dbConnect(duckdb::duckdb(), "data/qcew_raw/qcew.duckdb")
-# read all files into single table
-qcew_files <- list.files("data/qcew_raw/csv", full.names = TRUE)
+```
 
-# commented out to avoid overwriting existing table
-# dbRemoveTable(con_qcew, "qcew") # remove table if it exists
-
-# qcew_db <- duckdb_read_csv(
-#   con_qcew,
-#   name = "qcew",
-#   qcew_files,
-#     col.names = qcew_layout$field_name,
-#     col.types = qcew_layout$duckdb_type
-# )
+```{r}
+#| label: load_qcew
 
 # create a table of all qcew data
-qcew <- tbl(con_qcew, "qcew") |> 
-    collect()
-qcew
+qcew_db <- tbl(con_qcew, "qcew")
+
+# create crosswalks from QCEW data
+# create function for creating crosswalk
+create_crosswalk_qcew <- function(qcew_col) {
+  code <- paste0(qcew_col, "_code")
+  title <- paste0(qcew_col, "_title")
+
+  qcew_db |>
+    select(!!code, !!title) |>
+    distinct() |>
+    collect() |>
+    arrange(!!code)
+}
+
+# apply function to create crosswalks for each QCEW column
+crosswalks$qcew <- c("industry", "agglvl", "own") |>
+  set_names() |>
+  map(create_crosswalk_qcew)
+
+# extract relevant columns and filter agg levels to 50-55 (down to 3 digit NAICS)
+qcew_data <- qcew_db |>
+  mutate(
+    across(
+      c(year, agglvl_code),
+      as.integer
+    )
+  ) |>
+  filter(
+    agglvl_code %in% c(50:55) & qtr == "A"
+  ) |>
+  select(
+    year,
+    area_fips,
+    own_code,
+    agglvl_code,
+    industry_code,
+    disclosure_code,
+    emp = annual_avg_emplvl,
+    wage = total_annual_wages
+  ) |>
+  collect() |>
+  arrange(year, area_fips, own_code, industry_code)
+
+```
+
+# Sole Proprietors
+
+```{r}
+#| label: load_nes_years
+
+# get available years using censusapi
+years_nes <- listCensusApis() |> 
+  filter(name == "nonemp") |> 
+  pull(vintage)
+
+```
+
+Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(years_nes)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code.
+
+```{r}
+#| label: load_nes
+
+# load NES variables for most recent year
+nes_vars <- listCensusMetadata(
+  name = "nonemp",
+  vintage = max(years_nes),
+  type = "variables"
+)
+
+get_nes_data <- function(vintage) {
+  # get list of variables for vintage
+  nes_vars <- listCensusMetadata(
+    name = "nonemp",
+    vintage = vintage,
+    type = "variables"
+  ) |> 
+    filter(is.na(predicateOnly)) |> 
+    pull(name)
+
+  # get NES data for a given year
+  data <- getCensus(
+    name = "nonemp",
+    vintage = vintage,
+    vars = nes_vars,
+    region = "county:*",
+    regionin = "state:08"
+  ) |> 
+    mutate(vintage = vintage, .before = 1)
+
+  return(data)
+}
+
+
+nes_all_years <- map(
+  c(2000:max(years_nes)), 
+  get_nes_data,
+  .progress = TRUE)
+
+nes_dt <- bind_rows(nes_all_years)
+
+dbWriteTable(
+  con_qcew,
+  "nes",
+  bind_rows(nes_all_years),
+  append = TRUE
+)
+
 ```
