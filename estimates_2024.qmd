@@ -33,14 +33,21 @@ library(RPostgres)
 library(duckdb)
 library(dbplyr)
 library(censusapi)
+library(connections)
+library(duckplyr)
 ```
 
 Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials^[See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`]. The `duckdb` package is used to create a local DuckDB database for processing the data stored as `data/qcew.duckdb`.
 
 ```{r}
 #| label: connect_to_db
+
+# create connections list
+conn <- list()
+
+
 # connect to SDO Postgres database
-con_pgsdo <- DBI::dbConnect(
+conn$pgsdo <- DBI::dbConnect(
   RPostgres::Postgres(),
   dbname = 'dola',
   host = '104.197.26.248',
@@ -50,27 +57,35 @@ con_pgsdo <- DBI::dbConnect(
 )
 
 # Connect to duckdb database of all QCEW data
-con_qcew <- dbConnect(duckdb::duckdb(), "data/qcew.duckdb")
+conn$qcew <- dbConnect(duckdb::duckdb(), "data/qcew.duckdb")
 
 # Optional - use connections for browsing database in compatabile IDE (e.g., RStudio/Positron)
-connections::connection_view(con_pgsdo)
-connections::connection_view(con_qcew)
+connections::connection_view(conn$pgsdo)
+connections::connection_view(conn$qcew)
+
+
+# create list for tables
+tbl <- list()
+
+# create list for functions
+fn <- list()
+
 ```
 
 ```{r}
 #| label: load_crosswalks
 
-dbListTables(con_pgsdo)
+dbListTables(conn$pgsdo)
 
 # create crosswalks list
 crosswalks <- list()
 
 # store crosswalk_region
 crosswalks$region <- tbl(
-  con_pgsdo,
+  conn$pgsdo,
   sql("SELECT * FROM econ.crosswalk_region")
-) %>%
-  collect()
+)
+
 ```
 
 # Total Estimated Jobs
@@ -92,37 +107,42 @@ First QCEW data is downloaded and processed for all years. QCEW data is accessed
 ```{r}
 #| label: load_qcew
 
-# create a table of all qcew data
-qcew_db <- tbl(con_qcew, "qcew")
+# create list for storing local qcew info
+qcew <- list()
 
-# create crosswalks from QCEW data
+# create a table of raw qcew data
+qcew$raw <- tbl(conn$qcew, "qcew") |>
+  collect()
+
 # create function for creating crosswalk
-create_crosswalk_qcew <- function(qcew_col) {
+fn$qcew <- function(qcew_col) {
   code <- paste0(qcew_col, "_code")
   title <- paste0(qcew_col, "_title")
 
-  qcew_db |>
-    select(!!code, !!title) |>
+  qcew$raw |>
+    select(year, all_of(code), all_of(title)) |>
     distinct() |>
-    collect() |>
-    arrange(!!code)
+    mutate(year = as.integer(year)) |>
+    mutate(yr_fltr = max(year, na.rm = TRUE) == year, .by = all_of(code)) |>
+    filter(yr_fltr) |>
+    select(-year) |>
+    arrange(!!sym(code)) |>
+    collect()
 }
 
 # apply function to create crosswalks for each QCEW column
 crosswalks$qcew <- c("industry", "agglvl", "own") |>
   set_names() |>
-  map(create_crosswalk_qcew)
+  map(fn$qcew)
 
 # extract relevant columns and filter agg levels to 50-55 (down to 3 digit NAICS)
-qcew_data <- qcew_db |>
+qcew$data <- qcew$raw |>
   mutate(
-    across(
-      c(year, agglvl_code),
-      as.integer
-    )
+    year = as.integer(year),
+    agglvl_code = as.integer(agglvl_code)
   ) |>
   filter(
-    agglvl_code %in% c(50:55) & qtr == "A"
+    qtr == "A"
   ) |>
   select(
     year,
@@ -130,11 +150,11 @@ qcew_data <- qcew_db |>
     own_code,
     agglvl_code,
     industry_code,
-    disclosure_code,
+    f_emp = disclosure_code,
+    f_wage = disclosure_code,
     emp = annual_avg_emplvl,
     wage = total_annual_wages
   ) |>
-  collect() |>
   arrange(year, area_fips, own_code, industry_code)
 
 ```
@@ -144,61 +164,178 @@ qcew_data <- qcew_db |>
 ```{r}
 #| label: load_nes_years
 
+# create nes list
+nes <- list()
+
 # get available years using censusapi
-years_nes <- listCensusApis() |> 
-  filter(name == "nonemp") |> 
+nes$info <- listCensusApis() |>
+  filter(name == "nonemp")
+
+nes$yrs$raw <- nes$info |>
   pull(vintage)
 
 ```
 
-Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(years_nes)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code.
+Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(nes$yrs$raw)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code. The NAICS code is renamed to `industry_code`^[As there are not strict concordances between NAICS years we leave these classified as they were at the time - as with the QCEW. At the industry level there should be minimal changes. The one exception to align with the QCEW is that the QCEW utilizes 2002 NAICS codes for all years prior to . 1997 to 2002 concordances were used, allocating evenly. ] to match the QCEW data, and use the `own_code` of `1` to indicate sole proprietors. The NES data is then stored in the DuckDB database for further analysis.
+
+```{r}
+#| label: create_naics_crosswalk
+
+# create crosswalk for NAICS codes
+crosswalks$naics <- read_csv_duckdb(
+  "data/crosswalks/naics1997_2002.csv",
+  options = list(
+    all_varchar = "true"
+  )
+) |>
+  collect() |>
+  select(
+    industry_code = NAICS97,
+    NAICS02 = NAICS02
+  ) |>
+  filter(!is.na(NAICS02)) |>
+  add_count(industry_code) |>
+  mutate(alloc = 1 / n) |>
+  select(-n)
+
+```
 
 ```{r}
 #| label: load_nes
 
 # load NES variables for most recent year
-nes_vars <- listCensusMetadata(
+nes$vars <- listCensusMetadata(
   name = "nonemp",
-  vintage = max(years_nes),
+  vintage = max(nes$yrs$raw),
   type = "variables"
 )
 
-get_nes_data <- function(vintage) {
+fn$get_nes_data <- function(vintage) {
   # get list of variables for vintage
-  nes_vars <- listCensusMetadata(
+  nes$vars <- listCensusMetadata(
     name = "nonemp",
     vintage = vintage,
     type = "variables"
-  ) |> 
-    filter(is.na(predicateOnly)) |> 
+  ) |>
+    filter(
+      is.na(predicateOnly) &
+        !(name %in% c("STATE", "COUNTY"))
+    ) |>
     pull(name)
 
   # get NES data for a given year
   data <- getCensus(
     name = "nonemp",
     vintage = vintage,
-    vars = nes_vars,
+    vars = nes$vars,
     region = "county:*",
     regionin = "state:08"
-  ) |> 
-    mutate(vintage = vintage, .before = 1)
+  ) |>
+    mutate(
+      vintage = vintage,
+      .before = 1
+    ) |>
+    # rename variables to lowercase
+    rename_with(tolower) |>
+    # rename naics to match QCEW
+    rename_with(
+      ~"industry_code",
+      matches("naics\\d{2,4}$")
+    )
 
   return(data)
 }
 
+nes$raw <- tbl(conn$qcew, "nes") |>
+  collect()
 
-nes_all_years <- map(
-  c(2000:max(years_nes)), 
-  get_nes_data,
-  .progress = TRUE)
+nes$yrs$db <- nes$raw |>
+  pull(vintage) |>
+  unique()
 
-nes_dt <- bind_rows(nes_all_years)
+nes$yrs$qry <- nes$info |>
+  select(vintage) |>
+  filter(vintage >= 2000 & !(vintage %in% nes$yrs$db)) |>
+  pull(vintage) |>
+  unique()
 
+# Store NES data in DuckDB
 dbWriteTable(
-  con_qcew,
+  conn$qcew,
   "nes",
-  bind_rows(nes_all_years),
+  map(
+    nes$yrs$qry,
+    fn$get_nes_data,
+    .progress = TRUE
+  ) |>
+    bind_rows(),
   append = TRUE
 )
+
+# Create crosswalk for NES data
+crosswalks$nes <- nes$raw |>
+  collect() |>
+  select(industry_code, sector, subsector, indlevel) |>
+  distinct() |>
+  arrange(industry_code)
+
+
+# Create table of relevant NES data
+nes$data <- nes$raw |>
+  mutate(
+    area_fips = paste0(state, county),
+    own_code = "5", # treat sole props as private,
+    industry_code = if_else(
+      industry_code == "00",
+      "10",
+      industry_code
+    )
+  ) |>
+  select(
+    year = vintage,
+    area_fips,
+    industry_code,
+    own_code,
+    emp = nestab,
+    wage = nrcptot,
+    f_emp = nestab_f,
+    f_wage = nrcptot_f
+  )
+
+```
+
+# Combined Series
+
+Next the QCEW data is joined with the NES data to create a combined table of employment and income data for both wage and salary and sole proprietor jobs, with the former coming from the QCEW and the latter from the NES.
+```{r}
+#| label: create_combined_series
+
+# create combined series of QCEW and NES data
+total_estimated_jobs <- qcew$data |>
+  filter(own_code %in% c("1", "2", "3", "5")) |>
+  full_join(
+    nes$data |>
+      filter((emp + wage) > 0 & is.na(f_emp) & is.na(f_wage)),
+    by = c("year", "area_fips", "industry_code", "own_code"),
+    suffix = c("_ws", "_prop")
+  ) |>
+  mutate(
+    emp = emp_ws + emp_prop,
+    wage = wage_ws + wage_prop
+  )
+
+total_estimated_jobs <- total_estimated_jobs |>
+  bind_rows(
+    total_estimated_jobs |>
+      summarize(
+        across(
+          starts_with("emp"),
+          ~ sum(.x, na.rm = TRUE)
+        ),
+        .by = c("year", "area_fips", "industry_code")
+      ) |>
+      mutate(own_code = "0")
+  ) |>
+  arrange(year, area_fips, industry_code, own_code)
 
 ```
