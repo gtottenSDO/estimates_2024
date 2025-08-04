@@ -1,0 +1,73 @@
+mnemonic,naics,own_code,ind,description,ind_sort
+FET.IUSA,10,5,tot," Employment: Total Nonagricultural, (Mil. #, SA)",1
+FERM.IUSA,,5,," Employment: Natural Resources and Mining, (Mil. #, SA)",2
+FE1133.IUSA,1133,5,natresource," Employment: Logging, (Mil. #, SA)",3
+FE21.IUSA,21,5,min," Employment: Mining, (Mil. #, SA)",4
+FE23.IUSA,23,5,const," Employment: Construction, (Mil. #, SA)",5
+FEMF.IUSA,31-33,5,man," Employment: Manufacturing - Total, (Mil. #, SA)",6
+FEMFD.IUSA,,5,," Employment: Manufacturing - Durable Goods, (Mil. #, SA)",7
+FEMFN.IUSA,,5,," Employment: Manufacturing - Nondurable Goods, (Mil. #, SA)",8
+FE311.IUSA,311,5,," Employment: Manufacturing - Food, (Mil. #, SA)",9
+FE312.IUSA,312,5,," Employment: Manufacturing - Beverages and Tobacco Products, (Mil. #, SA)",10
+FE313.IUSA,313,5,," Employment: Manufacturing - Textile Mills, (Mil. #, SA)",11
+FE314.IUSA,314,5,," Employment: Manufacturing - Textile Product Mills, (Mil. #, SA)",12
+FE315.IUSA,315,5,," Employment: Manufacturing - Apparel, (Mil. #, SA)",13
+FE316.IUSA,316,5,," Employment: Manufacturing - Leather and Allied Products, (Mil. #, SA)",14
+FE321.IUSA,321,5,," Employment: Manufacturing - Wood Products, (Mil. #, SA)",15
+FE322.IUSA,322,5,," Employment: Manufacturing - Paper and Paper Products, (Mil. #, SA)",16
+FE323.IUSA,323,5,," Employment: Manufacturing - Printing and Related Support Activities, (Mil. #, SA)",17
+FE324.IUSA,324,5,," Employment: Manufacturing - Petroleum and Coal Products, (Mil. #, SA)",18
+FE325.IUSA,325,5,," Employment: Manufacturing - Chemicals, (Mil. #, SA)",19
+FE326.IUSA,326,5,," Employment: Manufacturing - Plastics and Rubber Products, (Mil. #, SA)",20
+FE327.IUSA,327,5,," Employment: Manufacturing - Nonmetallic Mineral Products, (Mil. #, SA)",21
+FE331.IUSA,331,5,," Employment: Manufacturing - Primary Metals, (Mil. #, SA)",22
+FE332.IUSA,332,5,," Employment: Manufacturing - Fabricated Metal Products, (Mil. #, SA)",23
+FE333.IUSA,333,5,," Employment: Manufacturing - Machinery, (Mil. #, SA)",24
+FE334.IUSA,334,5,," Employment: Manufacturing - Computer and Electronic Products, (Mil. #, SA)",25
+FE335.IUSA,335,5,," Employment: Manufacturing - Electrical Equipment and Appliances, (Mil. #, SA)",26
+FE336.IUSA,336,5,," Employment: Manufacturing - Transportation Equipment, (Mil. #, SA)",27
+FE337.IUSA,337,5,," Employment: Manufacturing - Furniture and Related Products, (Mil. #, SA)",28
+FE339.IUSA,339,5,," Employment: Manufacturing - Miscellaneous, (Mil. #, SA)",29
+FETL.IUSA,,5,," Employment: Trade; Transportation; and Utilities [42; 44 to 45; 48; 22], (Mil. #, SA)",30
+FE42.IUSA,42,5,tradewh," Employment: Wholesale Trade, (Mil. #, SA)",31
+FERT.IUSA,44-45,5,traderet," Employment: Retail Trade, (Mil. #, SA)",32
+FETU.IUSA,,5,," Employment: Transportation and Utilities, (Mil. #, SA)",33
+FERW.IUSA,48-49,5,transware," Employment: Transportation and Warehousing, (Mil. #, SA)",34
+FE22.IUSA,22,5,util," Employment: Utilities, (Mil. #, SA)",35
+FE51.IUSA,51,5,info," Employment: Information, (Mil. #, SA)",36
+FEFI.IUSA,,5,," Employment: Financial Activities, (Mil. #, SA)",37
+FE52.IUSA,52,5,fi," Employment: Finance and Insurance, (Mil. #, SA)",38
+FE53.IUSA,53,5,re," Employment: Real Estate and Rental and Leasing, (Mil. #, SA)",39
+FEPS.IUSA,,5,," Employment: Professional and Business Services, (Mil. #, SA)",40
+FE54.IUSA,54,5,pst," Employment: Professional and Technical Services, (Mil. #, SA)",41
+FE55.IUSA,55,5,manage," Employment: Management of Companies and Enterprises, (Mil. #, SA)",42
+FE56.IUSA,56,5,admin," Employment: Administrative and Waste Services, (Mil. #, SA)",43
+FEEH.IUSA,,5,," Employment: Education and Health Services, (Mil. #, SA)",44
+FE61.IUSA,61,5,edu," Employment: Educational Services, (Mil. #, SA)",45
+FE62.IUSA,62,5,health," Employment: Health Care and Social Assistance, (Mil. #, SA)",46
+FELH.IUSA,,5,," Employment: Leisure and Hospitality, (Mil. #, SA)",47
+FE71.IUSA,71,5,arts," Employment: Arts, (Mil. #, SA)",48
+FE72.IUSA,72,5,accom," Employment: Accommodations and Food Services, (Mil. #, SA)",49
+FE81.IUSA,81,5,othser," Employment: Other Services, (Mil. #, SA)",50
+FEGV.IUSA,,8,," Employment: Government - Total, (Mil. #, SA)",51
+FEGVF.IUSA,100,1,govf," Employment: Government - Federal, (Mil. #, SA)",52
+FEGVSL.IUSA,,,," Employment: Government - State and Local, (Mil. #, SA)",53
+FEGVS.IUSA,100,2,govs," Employment: Government - State, (Mil. #, SA)",54
+FEGVL.IUSA,100,3,govl," Employment: Government - Local, (Mil. #, SA)",55
+FEMFCE.IUSA,,5,," Employment: Chemicals; Energy; Plastics & Rubber Mfg., (Mil. #, SA)",56
+FEMFEE.IUSA,,5,," Employment: Electronic & Electrical Mfg., (Mil. #, SA)",57
+FEMFFB.IUSA,,5,," Employment: Food; Beverage & Tobacco Mfg., (Mil. #, SA)",58
+FEMFFM.IUSA,,5,," Employment: Furniture & Misc. Mfg., (Mil. #, SA)",59
+FEMFMM.IUSA,,5,," Employment: Metals & Mining Mfg., (Mil. #, SA)",60
+FEGOOD.IUSA,,5,," Employment: Goods-Producing, (Mil. #, SA)",61
+FETP.IUSA,,5,," Employment: Total Private, (Mil. #, SA)",62
+FESERVP.IUSA,,5,," Employment: Private Service-Producing, (Mil. #, SA)",63
+FEOFC.IUSA,,5,," Employment - Office-using industries, (Mil. #, SA)",64
+FEMFTF.IUSA,,5,," Employment: Textile; Fiber & Printing Mfg., (Mil. #, SA)",65
+FEMPTOTAL_I.IUSA,,5,," Employment: Total Private [Intermediate Value], (Mil. #, SAAR)",66
+FEZTECQ.IUSA,,5,," Employment: High-tech, (Mil. #, SA)",67
+FERTLQ.IUSA,,5,," Employment - Retail space using industries, (Mil. #, SA)",68
+FESECQ.IUSA,,5,," Employment: Secondary Industries, (Mil. #, SA)",69
+FETERQ.IUSA,,5,," Employment: Tertiary Industries, (Mil. #, SA)",70
+FEWARQ.IUSA,,5,," Employment - Warehouse-using industries, (Mil. #, SA)",71
+FEML.IUSA,,,," Employment: Government and government enterprises - Military, (Mil. #, SA)",72

@@ -5,3 +5,5 @@
 data/qcew_raw/zip
 data/qcew_raw/csv
 *.duckdb
+data/total_estimated_jobs.csv
+data/check_qcew.xlsx

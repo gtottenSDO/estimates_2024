@@ -35,6 +35,8 @@ library(dbplyr)
 library(censusapi)
 library(connections)
 library(duckplyr)
+library(sdoecon)
+library(fredr)
 ```
 
 Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials^[See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`]. The `duckdb` package is used to create a local DuckDB database for processing the data stored as `data/qcew.duckdb`.
@@ -62,10 +64,6 @@ conn$qcew <- dbConnect(duckdb::duckdb(), "data/qcew.duckdb")
 # Optional - use connections for browsing database in compatabile IDE (e.g., RStudio/Positron)
 connections::connection_view(conn$pgsdo)
 connections::connection_view(conn$qcew)
-
-
-# create list for tables
-tbl <- list()
 
 # create list for functions
 fn <- list()
@@ -135,14 +133,45 @@ crosswalks$qcew <- c("industry", "agglvl", "own") |>
   set_names() |>
   map(fn$qcew)
 
+# create crosswalk for ind and agglvl
+crosswalks$qcew$ind_agglvl <- qcew$raw |>
+  select(year, starts_with(c("own", "industry", "agglvl"))) |>
+  distinct() |>
+  mutate(year = as.integer(year)) |>
+  mutate(
+    yr_fltr = max(year, na.rm = TRUE) == year,
+    .by = (c("industry_code"))
+  ) |>
+  filter(yr_fltr) |>
+  select(-year) |>
+  collect() |>
+  arrange(industry_code, own_code, agglvl_code)
+
+crosswalks$qcew$indlvl <- crosswalks$qcew$ind_agglvl |>
+  mutate(
+    agglvl_code = if_else(
+      industry_code == "10",
+      "0",
+      agglvl_code
+    ),
+    indlvl = str_sub(agglvl_code, -1),
+  ) |>
+  select(industry_code, indlvl) |>
+  distinct() |>
+  arrange(industry_code) |>
+  collect() |>
+  arrange(industry_code)
+
+
 # extract relevant columns and filter agg levels to 50-55 (down to 3 digit NAICS)
 qcew$data <- qcew$raw |>
   mutate(
     year = as.integer(year),
-    agglvl_code = as.integer(agglvl_code)
+    agglvl_code = (agglvl_code)
   ) |>
   filter(
-    qtr == "A"
+    qtr == "A",
+    str_sub(area_fips, 1, 2) == "08", # Colorado
   ) |>
   select(
     year,
@@ -247,6 +276,8 @@ fn$get_nes_data <- function(vintage) {
 }
 
 nes$raw <- tbl(conn$qcew, "nes") |>
+  distinct() |>
+  arrange(vintage, state, industry_code, county) |>
   collect()
 
 nes$yrs$db <- nes$raw |>
@@ -291,16 +322,36 @@ nes$data <- nes$raw |>
       industry_code
     )
   ) |>
+  left_join(
+    crosswalks$qcew$indlvl
+  ) |>
   select(
     year = vintage,
     area_fips,
-    industry_code,
     own_code,
+    industry_code,
+    indlvl,
     emp = nestab,
     wage = nrcptot,
     f_emp = nestab_f,
     f_wage = nrcptot_f
-  )
+  ) %>%
+  # distinct() |>
+  bind_rows(
+    . |>
+      mutate(
+        area_fips = "08000", # Colorado total
+      ) |>
+      summarize(
+        across(
+          starts_with(c("emp", "wage")),
+          ~ sum(.x, na.rm = FALSE)
+        ),
+        .by = c("year", "area_fips", "industry_code", "indlvl", "own_code")
+      )
+  ) |>
+  arrange(year, area_fips, industry_code, own_code)
+
 
 ```
 
@@ -310,32 +361,232 @@ Next the QCEW data is joined with the NES data to create a combined table of emp
 ```{r}
 #| label: create_combined_series
 
+# create forecast data list
+fcst <- list()
+
 # create combined series of QCEW and NES data
-total_estimated_jobs <- qcew$data |>
-  filter(own_code %in% c("1", "2", "3", "5")) |>
+fcst$tej$series <- qcew$data |>
+  left_join(
+    crosswalks$qcew$indlvl
+  ) |>
+  relocate(indlvl, .after = industry_code) |>
+  select(-agglvl_code) |>
+  filter(
+    own_code %in%
+      c("1", "2", "3", "5") &
+      year >= 2000 &
+      indlvl %in% as.character(c(0:1, 4:5))
+  ) |>
   full_join(
     nes$data |>
-      filter((emp + wage) > 0 & is.na(f_emp) & is.na(f_wage)),
-    by = c("year", "area_fips", "industry_code", "own_code"),
-    suffix = c("_ws", "_prop")
+      filter((emp + wage) > 0),
+    by = c("year", "area_fips", "industry_code", "own_code", "indlvl"),
+    suffix = c("ws", "prop")
   ) |>
   mutate(
-    emp = emp_ws + emp_prop,
-    wage = wage_ws + wage_prop
-  )
-
-total_estimated_jobs <- total_estimated_jobs |>
+    across(
+      starts_with(c("emp", "wage")),
+      \(x) replace_na(x, 0)
+    ),
+    emp = empws + empprop,
+    wage = wagews + wageprop
+  ) %>%
   bind_rows(
-    total_estimated_jobs |>
+    . |>
+      # filter((agglvl_code%%10) %in% c(0, 3:5)) |>
+      mutate(
+        own_code = "0"
+      ) |>
       summarize(
         across(
-          starts_with("emp"),
-          ~ sum(.x, na.rm = TRUE)
+          starts_with(c("emp", "wage")),
+          ~ sum(.x, na.rm = FALSE)
         ),
-        .by = c("year", "area_fips", "industry_code")
-      ) |>
-      mutate(own_code = "0")
+        .by = c("year", "area_fips", "industry_code", "own_code", "indlvl")
+      )
   ) |>
+  relocate(starts_with("f_"), .after = last_col()) |>
   arrange(year, area_fips, industry_code, own_code)
 
+
+```
+
+# Forecast Preparation
+
+## Total Estimated Jobs
+Data next has to be prepared for forecasting in Eviews. This is done at the 2 digit NAICS level, and so data must be output at that level. Government jobs are aggregated into a single industry for each state, local, and federal government, and all other industries are private jobs.
+
+```{r}
+#| label: prepare_total_jobs
+
+# load jobs crosswalk from csv
+crosswalks$jobs <- read_csv(
+  "data/crosswalks/xwalk_jobs.csv",
+  col_types = "ccccci"
+)
+
+
+fcst$tej$output <- fcst$tej$series |>
+  select(
+    -starts_with("f_")
+  ) |>
+  pivot_longer(
+    starts_with(c("emp", "wage")),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  mutate(
+    naics = if_else(
+      own_code %in% c("1", "2", "3", "8"),
+      "100",
+      industry_code
+    ),
+    .after = industry_code
+  ) |>
+  inner_join(
+    crosswalks$jobs |>
+      select(
+        naics,
+        own_code,
+        ind,
+        ind_sort
+      ) |>
+      filter(
+        !is.na(ind)
+      )
+  ) |>
+  mutate(
+    area = if_else(
+      area_fips == "08000",
+      "co",
+      paste0("c", str_sub(area_fips, -3))
+    ),
+    var = paste(
+      str_replace_all(variable, "(e)mp|(w)age", "\\1\\2"),
+      ind,
+      area,
+      sep = "_"
+    )
+  ) |>
+  summarize(
+    value = sum(value, na.rm = TRUE),
+    .by = c(year, area_fips, var, ind_sort)
+  ) |>
+  arrange(year, area_fips, ind_sort) |>
+  pivot_wider(
+    names_from = "year",
+    values_from = "value"
+  ) |>
+  select(-ind_sort)
+
+# Save the output to a CSV file
+fcst$tej$output |>
+  filter(
+    area_fips == "08000"
+  ) |>
+  select(-area_fips) |>
+  write_csv("data/outputs/co_jobs_est.csv")
+```
+
+
+## Moodys Job Estimates
+Moodys Analytics provides national forecasts of various economic variables that are used to guide the Colorado forecasts. While most of these are industry job estimates, other variables are also used that may be useful in forecasting jobs at the local level. These variables are downloaded from the [Moodys Analytics Data Buffet](https://www.economy.com/data) and stored in the DuckDB database for further analysis. The data is downloaded using the `get_moodys_series` function, which retrieves the data for a given year and variable. A crosswalk file is used for mapping the Moodys analytics industry codes to the NAICS codes used in the Colorado estimates. 
+
+```{r}
+# | label: load_moodys_jobs
+
+# get list of moody's employment variables
+get_moodys_token()
+check_moodys_token()
+
+# pull list of moody's variables from the crosswalk to pipe into pull
+moodys_vars <- crosswalks$jobs |>
+  pull(mnemonic)
+
+
+# add moodys data using sdoecon get_moodys_series function
+fcst$moodys$raw <- map(
+  #break fcst into chunks of max 25
+  split(moodys_vars, seq_along(moodys_vars) %/% 25),
+  \(x) {
+    get_moodys_series(x, freq = "204") |>
+      convert_moodys()
+  }
+) |>
+  bind_rows()
+
+fcst$moodys$data <- fcst$moodys$raw |>
+  left_join(
+    crosswalks$jobs |>
+      mutate(
+        var = paste0("jobs_", ind, "_us")
+      ) |>
+      select(
+        mnemonic,
+        var
+      ),
+    by = c("mnemonic")
+  ) |>
+  relocate(var, .after = mnemonic) |>
+  mutate(
+    date = ymd(date)
+  ) |>
+  filter(
+    year(date) >= 2000
+  ) |>
+  pivot_wider(
+    names_from = date,
+    values_from = value
+  )
+
+# Save the output to a CSV file
+fcst$moodys$data |>
+  write_csv("data/outputs/moodys_vars.csv")
+```
+
+## FRED Variables
+
+A number of additional economic (non direct jobs) variables are used in the forecasting process, and these are downloaded from the [FRED API](https://fred.stlouisfed.org/). These variables are used to provide additional context for the forecasting process, and are stored in the DuckDB database for further analysis. The `get_fred_series` function from the fredr package is used to retrieve the data for a given year and variable. A crosswalk file is used for mapping FRED variables is stored in "data/crosswalks/xwalk_fred.csv".
+
+``` {r}
+# | label: load_fred_data
+
+# load fred crosswalk from csv
+crosswalks$fred <- read_csv(
+  "data/crosswalks/xwalk_fred.csv"
+)
+
+# pull variables from crosswalk to pipe into pull
+fcst$fred$raw <- crosswalks$fred |>
+  pmap(
+    \(fred_series, var) {
+      fredr(
+        fred_series,
+        frequency = "a",
+        aggregation_method = "avg"
+      ) |>
+        mutate(
+          var = var,
+          .after = series_id
+        )
+    },
+    .progress = TRUE
+  ) |>
+  bind_rows()
+
+fcst$fred$data <- fcst$fred$raw |>
+  mutate(
+    date = ymd(date)
+  ) |>
+  filter(
+    year(date) >= 2000
+  ) |>
+  pivot_wider(
+    names_from = date,
+    values_from = value
+  )
+
+# Save the output to a CSV file
+fcst$fred$data |>
+  write_csv("data/outputs/fred_vars.csv")
 ```
