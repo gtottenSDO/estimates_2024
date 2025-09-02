@@ -1,7 +1,7 @@
 mnemonic,naics,own_code,ind,description,ind_sort
-FET.IUSA,10,5,tot," Employment: Total Nonagricultural, (Mil. #, SA)",1
+FET.IUSA,10,0,tot," Employment: Total Nonagricultural, (Mil. #, SA)",1
 FERM.IUSA,,5,," Employment: Natural Resources and Mining, (Mil. #, SA)",2
-FE1133.IUSA,1133,5,natresource," Employment: Logging, (Mil. #, SA)",3
+FE1133.IUSA,11,5,ag," Employment: Logging, (Mil. #, SA)",3
 FE21.IUSA,21,5,min," Employment: Mining, (Mil. #, SA)",4
 FE23.IUSA,23,5,const," Employment: Construction, (Mil. #, SA)",5
 FEMF.IUSA,31-33,5,man," Employment: Manufacturing - Total, (Mil. #, SA)",6
@@ -48,7 +48,7 @@ FE62.IUSA,62,5,health," Employment: Health Care and Social Assistance, (Mil. #, 
 FELH.IUSA,,5,," Employment: Leisure and Hospitality, (Mil. #, SA)",47
 FE71.IUSA,71,5,arts," Employment: Arts, (Mil. #, SA)",48
 FE72.IUSA,72,5,accom," Employment: Accommodations and Food Services, (Mil. #, SA)",49
-FE81.IUSA,81,5,othser," Employment: Other Services, (Mil. #, SA)",50
+FE81.IUSA,81,5,other," Employment: Other Services, (Mil. #, SA)",50
 FEGV.IUSA,,8,," Employment: Government - Total, (Mil. #, SA)",51
 FEGVF.IUSA,100,1,govf," Employment: Government - Federal, (Mil. #, SA)",52
 FEGVSL.IUSA,,,," Employment: Government - State and Local, (Mil. #, SA)",53

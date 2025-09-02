@@ -64,3 +64,9 @@ qcew_db <- duckdb_read_csv(
   col.names = qcew_layout$field_name,
   col.types = qcew_layout$duckdb_type
 )
+
+# download crosswalks from bls
+download.file(
+  "https://www.bls.gov/cew/classifications/industry/industry-titles.csv",
+  "data/crosswalks/bls/industry-titles.csv"
+)
