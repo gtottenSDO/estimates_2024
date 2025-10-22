@@ -1,4 +1,6 @@
 # download QCEW data for all years
+params$est_year <- 2024
+
 # create list of download URLs
 download_urls <- paste0(
   "https://data.bls.gov/cew/data/files/",
@@ -39,7 +41,8 @@ zip_file_list <- map(zip_list, function(zip_file) {
 
 # read file layout from qcew documentation
 qcew_layout <- read_csv(
-  "https://www.bls.gov/cew/about-data/downloadable-file-layouts/annual/naics-based-annual-layout-csv.csv"
+  # "https://www.bls.gov/cew/about-data/downloadable-file-layouts/annual/naics-based-annual-layout-csv.csv"
+  "data/crosswalks/naics-based-annual-layout-csv.csv"
 ) |>
   mutate(
     duckdb_type = case_when(
@@ -55,10 +58,10 @@ qcew_layout <- read_csv(
 qcew_files <- list.files("data/qcew_raw/csv", full.names = TRUE)
 
 # commented out to avoid overwriting existing table
-dbRemoveTable(con_qcew, "qcew") # remove table if it exists
+dbRemoveTable(conn$qcew, "qcew") # remove table if it exists
 
 qcew_db <- duckdb_read_csv(
-  con_qcew,
+  conn$qcew,
   name = "qcew",
   qcew_files,
   col.names = qcew_layout$field_name,

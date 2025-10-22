@@ -135,6 +135,31 @@ crosswalks$qcew <- c("industry", "agglvl", "own") |>
   set_names() |>
   map(fn$qcew)
 
+# create crosswalk for industry to agglvl
+crosswalks$qcew$ind_agg <- qcew$raw |>
+  mutate(
+    agglvl_code = as.integer(agglvl_code) 
+  ) |> 
+  filter(
+    agglvl_code >= 50
+  ) |> 
+  mutate(
+    geo_type = if_else(
+      area_fips == "08000",
+      "s",
+      "c"
+    )
+  ) |> 
+  select(
+  geo_type,
+    own_code,
+    industry_code,
+    agglvl_code
+  ) |>
+  distinct() |>
+  arrange(industry_code, own_code, agglvl_code) |>
+  collect()
+
 # extract relevant columns and filter agg levels to 50-55 (down to 3 digit NAICS)
 qcew$data <- qcew$raw |>
   mutate(
@@ -231,6 +256,18 @@ fn$get_nes_data <- function(vintage) {
     region = "county:*",
     regionin = "state:08"
   ) |>
+    bind_rows(
+      # add Colorado state totals
+      getCensus(
+        name = "nonemp",
+        vintage = vintage,
+        vars = nes$vars,
+        region = "state:08"
+      ) |>
+        mutate(
+          county = "000" # Colorado state total
+        )
+    ) |>
     mutate(
       vintage = vintage,
       .before = 1
@@ -241,7 +278,8 @@ fn$get_nes_data <- function(vintage) {
     rename_with(
       ~"industry_code",
       matches("naics\\d{2,4}$")
-    )
+    ) |>
+    arrange(vintage, state, county, industry_code)
 
   return(data)
 }
@@ -284,15 +322,25 @@ crosswalks$nes <- nes$raw |>
 nes$data <- nes$raw |>
   mutate(
     area_fips = paste0(state, county),
-    own_code = "5", # treat sole props as private,
+    own_code = if_else(
+      industry_code == "00",
+      "0", # all other industries
+      "5"
+    ), # treat sole props as private,
     industry_code = if_else(
       industry_code == "00",
       "10",
       industry_code
+    ),
+    geo_type = if_else(
+      area_fips == "08000",
+      "s", # state
+      "c"  # county
     )
   ) |>
   select(
     year = vintage,
+    geo_type,
     area_fips,
     industry_code,
     own_code,
@@ -300,7 +348,10 @@ nes$data <- nes$raw |>
     wage = nrcptot,
     f_emp = nestab_f,
     f_wage = nrcptot_f
-  )
+  ) |> 
+    left_join(
+      crosswalks$qcew$ind_agg
+    )
 
 ```
 
@@ -311,31 +362,80 @@ Next the QCEW data is joined with the NES data to create a combined table of emp
 #| label: create_combined_series
 
 # create combined series of QCEW and NES data
-total_estimated_jobs <- qcew$data |>
-  filter(own_code %in% c("1", "2", "3", "5")) |>
+total_estimated_jobs <-expand_grid(
+  year = nes$yrs$db, 
+  qcew$data |> 
+    distinct(
+      area_fips, industry_code, own_code, agglvl_code
+    )
+) |> 
+  arrange(
+    year, area_fips, industry_code, own_code
+  ) |> 
   full_join(
     nes$data |>
-      filter((emp + wage) > 0 & is.na(f_emp) & is.na(f_wage)),
-    by = c("year", "area_fips", "industry_code", "own_code"),
+      filter((emp + wage) > 0 & is.na(f_emp) & is.na(f_wage)) |>
+      # bind_rows(
+      #   nes$data |>
+      #     filter((emp + wage) > 0 & is.na(f_emp) & is.na(f_wage)) |>
+      #     summarize(
+      #       own_code = "0",
+      #       emp = sum(emp, na.rm = TRUE),
+      #       wage = sum(wage, na.rm = TRUE),
+      #       .by = c("year", "area_fips", "industry_code")
+      #     ) |> 
+      #       left_join(
+      #         crosswalks$qcew$ind_agg
+      #       )
+      # ) |>
+      arrange(year, area_fips, industry_code, own_code),
+    by = c("year", "area_fips", "industry_code", "own_code", "agglvl_code"),
     suffix = c("_ws", "_prop")
   ) |>
   mutate(
+    across(
+      starts_with("emp"),
+      ~ replace_na(.x, 0)
+    ),
     emp = emp_ws + emp_prop,
     wage = wage_ws + wage_prop
-  )
-
-total_estimated_jobs <- total_estimated_jobs |>
-  bind_rows(
-    total_estimated_jobs |>
-      summarize(
-        across(
-          starts_with("emp"),
-          ~ sum(.x, na.rm = TRUE)
-        ),
-        .by = c("year", "area_fips", "industry_code")
-      ) |>
-      mutate(own_code = "0")
   ) |>
   arrange(year, area_fips, industry_code, own_code)
+
+write_csv(total_estimated_jobs, "data/total_estimated_jobs.csv")
+
+```
+
+``` {r}
+#| label: check_total_estimated_jobs
+
+#verify aggregated totals (based on own_code ==0 and ind_code == "10") match totals from QCEW and NES
+
+# verify NES
+total_estimated_jobs |>
+  filter(own_code == 0 & industry_code == "10") |>
+  select(year, area_fips, emp_prop) |>
+  filter(year >= 2000) |>
+  left_join(
+    nes$data |>
+      filter(industry_code == "10") |>
+      summarize(
+        emp = sum(emp, na.rm = TRUE),
+        .by = c("year", "area_fips")
+      )
+  ) |>
+  filter(emp_prop != emp)
+
+# verify QCEW
+total_estimated_jobs |>
+  filter(own_code == 0 & industry_code == "10") |>
+  select(year, area_fips, emp_ws) |>
+  left_join(
+    qcew$data |>
+      filter(industry_code == "10" & own_code == "0") |>
+      select(year, area_fips, emp)
+  ) |>
+  filter(emp_ws != emp) |>
+  arrange(year, area_fips)
 
 ```
