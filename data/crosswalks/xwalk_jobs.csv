@@ -50,10 +50,10 @@ FE71.IUSA,71,5,arts," Employment: Arts, (Mil. #, SA)",48
 FE72.IUSA,72,5,accom," Employment: Accommodations and Food Services, (Mil. #, SA)",49
 FE81.IUSA,81,5,other," Employment: Other Services, (Mil. #, SA)",50
 FEGV.IUSA,,8,," Employment: Government - Total, (Mil. #, SA)",51
-FEGVF.IUSA,100,1,govf," Employment: Government - Federal, (Mil. #, SA)",52
+FEGVF.IUSA,10,1,govf," Employment: Government - Federal, (Mil. #, SA)",52
 FEGVSL.IUSA,,,," Employment: Government - State and Local, (Mil. #, SA)",53
-FEGVS.IUSA,100,2,govs," Employment: Government - State, (Mil. #, SA)",54
-FEGVL.IUSA,100,3,govl," Employment: Government - Local, (Mil. #, SA)",55
+FEGVS.IUSA,10,2,govs," Employment: Government - State, (Mil. #, SA)",54
+FEGVL.IUSA,10,3,govl," Employment: Government - Local, (Mil. #, SA)",55
 FEMFCE.IUSA,,5,," Employment: Chemicals; Energy; Plastics & Rubber Mfg., (Mil. #, SA)",56
 FEMFEE.IUSA,,5,," Employment: Electronic & Electrical Mfg., (Mil. #, SA)",57
 FEMFFB.IUSA,,5,," Employment: Food; Beverage & Tobacco Mfg., (Mil. #, SA)",58

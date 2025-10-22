@@ -1,0 +1,51 @@
+---
+title: "Suppressing Jobs Data"
+format: html
+---
+
+Jobs data estimates needs to be supressed according to BLS guidelines according to the 80/3 rule. This rule requires that that if a single firm is 80% or greater of the total employment in an industry within a given area, or if there are 3 or fewer firms in an industry within a given area, then the data must be suppressed.
+
+# Setup
+
+First we load the necessary libraries and data.
+
+```{r}
+library(tidyverse)
+library(duckdb)
+library(dbplyr)
+
+```
+
+# Connect to DuckDB Database
+
+Load the database with the jobs data from the `data/qcew.duckdb` file created in the initial estimates calculations.
+
+```{r}
+#| label: load-db
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "data/qcew.duckdb")
+connections::connection_open(duckdb::duckdb(), "data/qcew.duckdb")
+
+estimates_raw <- tbl(con, "total_estimated_jobs")
+```
+
+# Apply Suppression Rules
+
+Now we apply the suppression rules to the data.
+
+```{r}
+#| label: apply-suppression
+
+suppressed_estimates <- estimates_raw %>%
+  group_by(year, quarter, area_fips, industry_code) %>%
+  mutate(
+    total_employment = sum(estimated_jobs, na.rm = TRUE),
+    firm_count = n(),
+    max_firm_employment = max(estimated_jobs, na.rm = TRUE),
+    percent_max_firm = (max_firm_employment / total_employment) * 100,
+    suppress = if_else(percent_max_firm >= 80 | firm_count <= 3, TRUE, FALSE),
+    estimated_jobs_suppressed = if_else(suppress, NA_real_, estimated_jobs)
+  ) %>%
+  select(-total_employment, -firm_count, -max_firm_employment, -percent_max_firm, -suppress)
+
+```
