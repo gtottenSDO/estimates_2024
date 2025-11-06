@@ -13,6 +13,9 @@ First we load the necessary libraries and data.
 library(tidyverse)
 library(duckdb)
 library(dbplyr)
+library(DBI)
+library(dbplyr)
+library(sdodemog)
 
 ```
 
@@ -29,6 +32,7 @@ connections::connection_open(duckdb::duckdb(), "data/qcew.duckdb")
 estimates_raw <- tbl(con, "total_estimated_jobs")
 ```
 
+
 # Apply Suppression Rules
 
 Now we apply the suppression rules to the data.
@@ -37,15 +41,100 @@ Now we apply the suppression rules to the data.
 #| label: apply-suppression
 
 suppressed_estimates <- estimates_raw %>%
-  group_by(year, quarter, area_fips, industry_code) %>%
+  filter(
+    (own_code %in% c("0", "1", "2", "3") & ind_lvl == "0") |
+      own_code == 5 & ind_lvl == "2"
+      ) |>
+        mutate(
+          ind_code = if_else(
+            own_code %in% c("1", "2", "3"), own_code, ind_code
+          )
+        ) |> 
+  collect() |>
+  select(-contains("ws"), -contains("inc"), -starts_with("f_")) |>
+  relocate(largest_firm, .after = firms) |>
   mutate(
-    total_employment = sum(estimated_jobs, na.rm = TRUE),
-    firm_count = n(),
-    max_firm_employment = max(estimated_jobs, na.rm = TRUE),
-    percent_max_firm = (max_firm_employment / total_employment) * 100,
-    suppress = if_else(percent_max_firm >= 80 | firm_count <= 3, TRUE, FALSE),
-    estimated_jobs_suppressed = if_else(suppress, NA_real_, estimated_jobs)
-  ) %>%
-  select(-total_employment, -firm_count, -max_firm_employment, -percent_max_firm, -suppress)
+    largest_firm_share = largest_firm / jobs,
+    initial_suppression = if_else(
+      largest_firm_share >= 0.8 | firms <= 3,
+      TRUE,
+      FALSE
+    )
+  ) |>
+  mutate(
+    suppression_count = sum(initial_suppression),
+    min_ind = ind_code[which.min(replace_na(jobs, Inf))],
+    .by = c(area_fips, ind_lvl, year)
+  )
+
+# find
+# find the industry code for the industry with lowest number of jobs of all industries including those that are not suppressed
+suppress_additional <- suppressed_estimates |>
+  filter(suppression_count == 1 & !initial_suppression) |>
+  mutate(
+    min_ind = ind_code[which.min(replace_na(jobs, Inf))],
+    .by = c(area_fips, ind_lvl, year)
+  ) |>
+  filter(ind_code == min_ind)
+
+final_suppressed_estimates <- suppressed_estimates |>
+  left_join(
+    suppress_additional |>
+      select(area_fips, ind_lvl, year, ind_code) |>
+      mutate(additional_suppression = TRUE),
+    by = c("area_fips", "ind_lvl", "year", "ind_code")
+  ) |>
+  mutate(
+    additional_suppression = replace_na(additional_suppression, FALSE),
+    final_suppression = initial_suppression | additional_suppression,
+    final_jobs = if_else(final_suppression, NA_real_, jobs),
+    largest_firm = if_else(final_suppression, NA_real_, largest_firm)
+  )
+
+suppressed_totals <- final_suppressed_estimates |>
+  filter(final_suppression) |>
+  summarize(
+    total_jobs = sum(jobs, na.rm = TRUE),
+    .by = c(year, area_lvl, area_fips, ind_lvl)
+  ) |>
+  arrange(year, area_lvl, area_fips, ind_lvl)
+
+supressed_totals_by_year_lvl <- suppressed_totals |>
+  summarize(
+    total_jobs = sum(total_jobs, na.rm = TRUE),
+    .by = c(year, area_lvl, ind_lvl)
+  ) |>
+  arrange(year, area_lvl, ind_lvl)
+
+final_jobs_table <- final_suppressed_estimates |>
+  filter(ind_lvl %in% c("0", "2") & year >= 2001) |>
+  mutate(area_id = str_sub(area_fips, -3)) |>
+  select(
+    year,
+    area_id,
+    ind_code,
+    jobs = final_jobs
+  )
+
+# add to database
+sdo_db_write_table(
+  final_jobs_table,
+  schema = "econ",
+  table = "jobs_estimates",
+  vintage = "2024",
+  version = "v1",
+  latest = TRUE,
+  overwrite = TRUE
+)
+
+dbDisconnect(con)
+```
+
+# Compare to prior Estimates
+
+Now we can compare the suppressed estimates to the prior estimates to see the impact of the suppression.
+
+```{r}
+#| label: compare-estimates
 
 ```

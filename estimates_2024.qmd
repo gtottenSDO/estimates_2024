@@ -1023,20 +1023,30 @@ Next the QCEW data is joined with the NES data to create a combined table of emp
 
 # create forecast data list
 fcst <- list()
-qcew$data <- read_csv("data/inputs/qcew_micro.csv", col_types = "dccccdd") |>
+
+qcew_con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir = "G:/Shared drives/SDO Econ/qcew/microdata/qcew.db",
+  read_only = FALSE
+)
+
+qcew$data <- tbl(qcew_con, "qcew_views.total_emp") |>
   rename(
     area_fips = cnty,
     ind_code = naics,
-    ind_lvl = LEVEL,
+    ind_lvl = lvl,
     ws = employment,
     inc = wages
   ) %>%
+  collect() %>%
   bind_rows(
     . |>
       summarize(
         area_fips = "000",
         ws = sum(ws, na.rm = TRUE),
         inc = sum(inc, na.rm = TRUE),
+        total_firms = sum(total_firms, na.rm = TRUE),
+        largest_firm = max(largest_firm, na.rm = TRUE),
         .by = c("year", "ind_code", "ind_lvl", "own_code")
       )
   ) |>
@@ -1044,6 +1054,9 @@ qcew$data <- read_csv("data/inputs/qcew_micro.csv", col_types = "dccccdd") |>
 
 # create list of wage and salary job changes to use to advance jobs by one year based on pct change
 qcew$changes <- qcew$data |>
+  filter(
+    ind_lvl <= 3
+  ) |>
   select(
     year,
     area_fips,
@@ -1088,8 +1101,9 @@ fcst$tej$series_c <- qcew$data |>
     area_fips = paste0("08", area_fips),
     own_code = str_sub(own_code, 1, 1),
     ind_code = if_else(ind_code == "00", "10", ind_code),
-    ind_lvl = if_else(ind_code == "10", "0", ind_lvl)
+    ind_lvl = if_else(ind_code == "10", "0", as.character(ind_lvl))
   ) |>
+  rename(firmws = total_firms) |>
   filter(
     own_code %in%
       c("1", "2", "3", "5") &
@@ -1117,11 +1131,12 @@ fcst$tej$series_c <- qcew$data |>
       "county"
     ),
     across(
-      starts_with(c("ws", "inc", "prop")),
+      starts_with(c("ws", "inc", "prop", "firmws", "largest_firm")),
       \(x) replace_na(x, 0)
     ),
     jobs = ws + prop,
-    inc = incws + incp
+    inc = incws + incp,
+    firms = firmws + prop
   ) |>
   relocate(area, .after = area_fips) %>%
   # add consolidate 0 ownership code series
@@ -1133,8 +1148,12 @@ fcst$tej$series_c <- qcew$data |>
       ) |>
       summarize(
         across(
-          starts_with(c("jobs", "ws", "inc", "prop")),
+          starts_with(c("jobs", "ws", "inc", "prop", "firmws", "firms")),
           ~ sum(.x, na.rm = FALSE)
+        ),
+        across(
+          starts_with("largest_firm"),
+          ~ max(.x, na.rm = TRUE)
         ),
         .by = c(
           "year",
@@ -1168,8 +1187,12 @@ fcst$tej$series_r <- fcst$tej$series_c |>
   ) |>
   summarize(
     across(
-      starts_with(c("jobs", "ws", "inc", "prop")),
+      starts_with(c("jobs", "ws", "inc", "prop", "firm")),
       ~ sum(.x, na.rm = TRUE)
+    ),
+    across(
+      starts_with("largest_firm"),
+      ~ max(.x, na.rm = TRUE)
     ),
     .by = c(
       "year",
@@ -1196,6 +1219,8 @@ dbWriteTable(
   overwrite = TRUE
 )
 
+dbDisconnect(qcew_con)
+dbDisconnect(conn$qcew)
 
 ```
 
@@ -1307,19 +1332,32 @@ fcst$vars$jobs <- crosswalks$jobs |>
 # add moodys data using sdoecon get_moodys_series function
 fcst$moodysjobs$raw <- map(
   #break fcst into chunks of max 25
-  split(fcst$vars$jobs, seq_along(fcst$vars$jobs) %/% 25),
+  expand_grid(split(fcst$vars$jobs, seq_along(fcst$vars$jobs) %/% 25), as.character(c(1:12))),
   \(x) {
-    get_moodys_series(x, freq = "204") |>
+    get_moodys_series(x, vintage = "202508", freq = "204") |>
       convert_moodys()
   }
 ) |>
   bind_rows()
 
+map(as.character(c(1:12)), \(x) {
+  get_moodys_series(
+    "FET.IUSA",
+    vintage = paste0("2024", x),
+    freq = "204"
+  ) |> 
+    convert_moodys() |>
+    mutate(
+      vintage = paste0("2024", "-", x)
+    )
+})
+
+
 sdo_db_write_table(
   fcst$moodysjobs$raw,
   schema = "forecast",
   table = "moodys",
-  vintage = "2025-09",
+  vintage = "2025-",
   version = "v1",
   overwrite = TRUE,
   latest = TRUE
