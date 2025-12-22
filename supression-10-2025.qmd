@@ -30,6 +30,8 @@ con <- dbConnect(duckdb::duckdb(), dbdir = "data/qcew.duckdb")
 connections::connection_open(duckdb::duckdb(), "data/qcew.duckdb")
 
 estimates_raw <- tbl(con, "total_estimated_jobs")
+
+qcew <- tbl(con, "qcew")
 ```
 
 
@@ -44,19 +46,39 @@ suppressed_estimates <- estimates_raw %>%
   filter(
     (own_code %in% c("0", "1", "2", "3") & ind_lvl == "0") |
       own_code == 5 & ind_lvl == "2"
-      ) |>
-        mutate(
-          ind_code = if_else(
-            own_code %in% c("1", "2", "3"), own_code, ind_code
-          )
-        ) |> 
+  ) |>
+  left_join(
+    qcew |>
+      select(
+        year,
+        area_fips,
+        own_code,
+        ind_code = industry_code,
+        annual_avg_emplvl
+      )
+  ) |>
+  mutate(
+    ind_code = if_else(
+      own_code %in% c("1", "2", "3"),
+      own_code,
+      ind_code
+    ),
+    ind_lvl = if_else(
+      own_code %in% c("1", "2", "3"),
+      "2",
+      ind_lvl
+    )
+  ) |>
   collect() |>
   select(-contains("ws"), -contains("inc"), -starts_with("f_")) |>
   relocate(largest_firm, .after = firms) |>
   mutate(
     largest_firm_share = largest_firm / jobs,
+    qcew_diff = abs(jobs - annual_avg_emplvl),
+    qcew_override = qcew_diff > 1,
     initial_suppression = if_else(
-      largest_firm_share >= 0.8 | firms <= 3,
+      (largest_firm_share >= 0.8 | firms <= 3) &
+        qcew_override,
       TRUE,
       FALSE
     )
@@ -115,14 +137,16 @@ final_jobs_table <- final_suppressed_estimates |>
     ind_code,
     jobs = final_jobs
   )
+```
 
+``` {r}
 # add to database
 sdo_db_write_table(
   final_jobs_table,
   schema = "econ",
   table = "jobs_estimates",
   vintage = "2024",
-  version = "v1",
+  version = "v4",
   latest = TRUE,
   overwrite = TRUE
 )

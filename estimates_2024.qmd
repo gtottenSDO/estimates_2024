@@ -49,6 +49,7 @@ library(ipumsr)
 library(readxl)
 library(imputeTS)
 library(sdodemog)
+library(httr2)
 ```
 
 Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials[^1]. The `duckdb` package is used to create a local DuckDB database for processing the data stored as `data/qcew.duckdb`.
@@ -305,7 +306,7 @@ A function has been created to do this process, `fn$apply_suppression_overrides`
 
 ### Industry Code `00` vs `10`
 
-Prior to starting this procedure industry codes `00` and `10` were compared for equivalency and to determine if one could be used all the time over the other, or if they were circumstantually dependent. This was done by comparing the two industries and looking for differences where one was greater than the other.
+Prior to starting this procedure industry codes `00` and `10` were compared for equivalency and to determine if one could be used all the time over the other, or if they were circumstantially dependent. This was done by comparing the two industries and looking for differences where one was greater than the other.
 
 ```{r}
 #| label: compare_ind_codes
@@ -1014,6 +1015,157 @@ nes$data <- nes$raw |>
 
 ```
 
+# Additional Series
+
+Additional series are added to the estimates as they become available. These series include 
+- Agriculture estimates from the Census of Ag
+- Military Employment estimates from the Department of Defense
+
+# Census of Agriculture
+Data from the [Census of Agriculture](https://www.nass.usda.gov/Publications/AgCensus/2022/index.php) is accessed using the USDA NASS API. An API key is required to access the data, which can be obtained from the [NASS Quick Stats API](https://quickstats.nass.usda.gov/api). The API key is stored in the `.Renviron` file for secure access. A function is created to retrieve data from the NASS API based on various parameters such as source description, sector description, group description, commodity description, statistic category description, state alpha code, aggregation level description, and year. The data is retrieved in CSV format and read into a data frame for further analysis.
+
+``` {r}
+#| label: load_census_of_ag
+source("r_scripts/nass_scripts.R")
+
+```
+
+Data is pulled to get the total number of farm owners, and total farm related employment by county for Colorado for all available Census of Ag years.
+
+```{r}
+#| label: get_census_of_ag_data
+
+census_of_ag <- read_csv_duckdb(
+  "data/inputs/census_of_ag/*",
+  prudence = "lavish"
+) |>
+  filter(STATE_ALPHA == "CO")
+
+
+ag_prop <- census_of_ag |>
+  filter(
+    str_detect(SHORT_DESC, "PRIMARY OCCUPATION, FARMING"),
+    str_detect(CLASS_DESC, "ALL"),
+    # str_detect(UNIT_DESC, "OPERAT"),
+    str_detect(DOMAIN_DESC, "TOTAL"),
+    !(YEAR == 2017 & COMMODITY_DESC == "PRODUCERS")
+  ) |>
+  collect()
+ag_prop <- ag_prop |>
+  mutate(
+    COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE)
+  ) |>
+  filter(
+    !(COUNTY_CODE == "000" &
+      YEAR %in% c("2007", "2012") &
+      SHORT_DESC !=
+        "OPERATORS, PRINCIPAL, PRIMARY OCCUPATION, FARMING - NUMBER OF OPERATORS"),
+    !(COUNTY_CODE == "000" &
+      YEAR %in% c("2017") &
+      SHORT_DESC !=
+        "PRODUCERS, PRINCIPAL, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
+    !(COUNTY_CODE == "000" &
+      YEAR %in% c("2022") &
+      SHORT_DESC !=
+        "PRODUCERS, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
+      !is.na(COUNTY_CODE)
+  )
+
+
+
+ag_ws <- census_of_ag |>
+  filter(
+    SECTOR_DESC == "ECONOMICS",
+    GROUP_DESC == "EXPENSES",
+    COMMODITY_DESC == "LABOR",
+    STATISTICCAT_DESC == "WORKERS",
+    DOMAIN_DESC == "TOTAL",
+    UNIT_DESC == "NUMBER",
+    str_detect(CLASS_DESC, "GT 150|GE 150")
+  ) |>
+  collect()
+ag_ws <- ag_ws |>
+  mutate(COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE))
+
+# interpolate data to fill in missing years using VALUE column
+
+# Prepare agriculture data: clean values and convert to numeric
+# First get all county-year combinations from the census years
+census_years <- distinct(ag_prop, YEAR)
+all_counties <- distinct(ag_prop, COUNTY_CODE, COUNTY_NAME) |>
+  arrange(COUNTY_CODE)
+
+ag_combined <- expand_grid(census_years, all_counties) |>
+  left_join(
+    ag_prop |>
+      mutate(
+        VALUE = na_if(
+          VALUE,
+          "(D)"
+        ),
+        prop = as.numeric(str_remove_all(VALUE, ","))
+      ) |>
+      select(YEAR, COUNTY_CODE, COUNTY_NAME, COMMODITY_DESC, SHORT_DESC, prop)
+  ) |>
+  left_join(
+    ag_ws |>
+      mutate(
+        COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE),
+        VALUE = na_if(
+          VALUE,
+          "(D)"
+        ),
+        ws = as.numeric(str_remove_all(VALUE, ","))
+      ) |>
+      select(YEAR, COUNTY_CODE, COUNTY_NAME, ws)
+  ) |>
+  mutate(
+    across(c(prop, ws), ~ replace_na(.x, 0)),
+    jobs = prop + ws,
+  ) |>
+  arrange(COUNTY_CODE, YEAR)
+
+# Check for missing values and "(D)" indicators
+ag_combined |>
+  filter(is.na(jobs)) |>
+  distinct(jobs)
+
+# Interpolate missing values for each county and type combination
+ag_interp <- expand_grid(
+  YEAR = 2001:2024,
+  distinct(ag_combined, COUNTY_CODE, COUNTY_NAME)
+) |>
+  left_join(ag_combined) |>
+  arrange(COUNTY_CODE, YEAR) |>
+  mutate(
+COUNTY_NAME = if_else(
+      COUNTY_CODE == "000",
+      "Colorado",
+      COUNTY_NAME
+    ),
+    interp_value = imputeTS::na_interpolation(
+      jobs,
+      option = "linear",
+      maxgap = 24
+    ),
+    ind_code = "11", # NAICS code for Agriculture, Forestry, Fishing and Hunting
+    .by = c(COUNTY_CODE)
+  ) |>
+  fill(interp_value, .direction = "downup")
+
+# Sum workers and proprietors to get total ag employment
+ag_total <- ag_interp |>
+  select(
+    year = YEAR,
+    area_fips = COUNTY_CODE,
+    COUNTY_NAME,
+    ind_code,
+    ag_jobs = interp_value
+  )
+
+write_csv(ag_total, "data/outputs/agriculture_employment.csv")
+```
+
 # Combined Series
 
 Next the QCEW data is joined with the NES data to create a combined table of employment and income data for both inc and salary and sole proprietor jobs, with the former coming from the QCEW and the latter from the NES.
@@ -1095,8 +1247,21 @@ nes$data <- nes$data |>
   )
 
 # create combined series of QCEW and NES data for counties
-fcst$tej$series_c <- qcew$data |>
+# fcst$tej$
+series_c <- qcew$data |>
   relocate(ind_lvl, .after = ind_code) |>
+  # add on ag data
+  left_join(
+    expand_grid(own_code = c("0", "5"), ag_total),
+    by = c("year", "area_fips", "ind_code", "own_code")
+  ) |>
+  mutate(
+    ag_jobs = if_else(
+      ind_code == "11" & !is.na(ag_jobs),
+      ag_jobs,
+      0
+    )
+  ) |>
   mutate(
     area_fips = paste0("08", area_fips),
     own_code = str_sub(own_code, 1, 1),
@@ -1134,10 +1299,11 @@ fcst$tej$series_c <- qcew$data |>
       starts_with(c("ws", "inc", "prop", "firmws", "largest_firm")),
       \(x) replace_na(x, 0)
     ),
-    jobs = ws + prop,
+    jobs = ws + prop + ag_jobs,
     inc = incws + incp,
     firms = firmws + prop
   ) |>
+  # select(-ag_jobs) |>
   relocate(area, .after = area_fips) %>%
   # add consolidate 0 ownership code series
   bind_rows(
@@ -1332,7 +1498,10 @@ fcst$vars$jobs <- crosswalks$jobs |>
 # add moodys data using sdoecon get_moodys_series function
 fcst$moodysjobs$raw <- map(
   #break fcst into chunks of max 25
-  expand_grid(split(fcst$vars$jobs, seq_along(fcst$vars$jobs) %/% 25), as.character(c(1:12))),
+  expand_grid(
+    split(fcst$vars$jobs, seq_along(fcst$vars$jobs) %/% 25),
+    as.character(c(1:12))
+  ),
   \(x) {
     get_moodys_series(x, vintage = "202508", freq = "204") |>
       convert_moodys()
@@ -1345,7 +1514,7 @@ map(as.character(c(1:12)), \(x) {
     "FET.IUSA",
     vintage = paste0("2024", x),
     freq = "204"
-  ) |> 
+  ) |>
     convert_moodys() |>
     mutate(
       vintage = paste0("2024", "-", x)

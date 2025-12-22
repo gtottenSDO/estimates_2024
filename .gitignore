@@ -8,3 +8,5 @@ data/qcew_raw/csv
 data/total_estimated_jobs.csv
 data/check_qcew.xlsx
 data/qcew_raw/lmi
+data/inputs/qcew_micro.csv
+data/inputs/census_of_ag
