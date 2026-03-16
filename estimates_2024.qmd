@@ -70,7 +70,7 @@ conn$pgsdo <- sdodemog::connect_to_sdo_db()
 conn$qcew <- dbConnect(
   duckdb::duckdb(),
   # storage location for duckdb database of all QCEW data - internal - change directory as needed - recommenced to save file down prior to running
-  dbdir = "G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db",
+  dbdir = if (interactive()) file.choose() else "G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db",
   read_only = TRUE
 )
 
