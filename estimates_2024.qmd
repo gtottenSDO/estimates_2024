@@ -3,11 +3,8 @@ title: "2024 Jobs Estimates"
 format: html
 params:
     est_year: 2024
-jupyter: 
-  kernelspec:
-    name: "ark"
-    language: "R"
-    display_name: "Ark R Kernel"
+execute:
+    eval: false
 ---
 
 # Overview
@@ -50,11 +47,14 @@ library(readxl)
 library(imputeTS)
 library(sdodemog)
 library(httr2)
+
 ```
 
-Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. Connection keys are stored in the `.Renviron` file, which is not included in this repository for security reasons. The Postgres database is accessed using the `DBI` and `RPostgres` packages. Credentials are stored in the `keyring` package, which allows for secure storage of credentials[^1]. The `duckdb` package is used to create a local DuckDB database for processing the data stored as `data/qcew.duckdb`.
+Crosswalks are loaded from the SDO Postgres database, using the generic public (non read-write) connection. The Postgres database connection is managed using the SDO's internal `sdodemog` package. Credentials are stored in the `keyring` package, which allows for secure storage of credentials[^1]. Crosswalks are stored in a list `xwalk` for reference throughout the process. The `pull_db_table` function from the `sdodemog` package is used to pull crosswalks from the database, and these are stored in the `xwalk` list for reference throughout the process.
 
-[^1]: See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`
+The `duckdb` package is used to create a local DuckDB connection to the SDO internal QCEW database found in `G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db`. This database contains the QCEW microdata that is provided to the SDO by Colorado Department of Labor and Employment's Labor Market Information (LMI) unit. The data is accessed using SQL queries, and processed using the `duckplyr` package for efficient processing of large datasets. Prior to running these scripts the QCEW database needs to be updated. This is done by running the necessary SQL scripts located in the `G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/` folder. Detailed instructions can be found in that documentation. The `connections` package is used to manage database connections and allow for browsing of the databases in compatible IDEs such as RStudio/Positron.
+
+[^1]: See https://keyring.r-lib.org/index.html for more information. Public credentials are stored under the service `"pgsdo"`, for the username `"codemog"`. Public credentials are read only, and restricted to what databases they can access. Users looking to write data should utilize their own internal individual credentials, which should include the necessary read/write privilages, as provided by the SDO staff.
 
 ```{r}
 #| label: connect_to_db
@@ -67,7 +67,12 @@ conn <- list()
 conn$pgsdo <- sdodemog::connect_to_sdo_db()
 
 # Connect to duckdb database of all QCEW data
-conn$qcew <- dbConnect(duckdb::duckdb(), "data/qcew.duckdb")
+conn$qcew <- dbConnect(
+  duckdb::duckdb(),
+  # storage location for duckdb database of all QCEW data - internal - change directory as needed - recommenced to save file down prior to running
+  dbdir = "G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db",
+  read_only = TRUE
+)
 
 # Optional - use connections for browsing database in compatabile IDE (e.g., RStudio/Positron)
 connections::connection_view(conn$pgsdo)
@@ -88,17 +93,22 @@ files$gdrive_folder <- "1bbsGG8Hwf8ZGEryFlyM-CTCfEQPfYyki"
 ```{r}
 #| label: load_crosswalks
 
-# create crosswalks list
-crosswalks <- list()
-
 # store crosswalk_region
-crosswalks$region <- tbl(
+xwalk_region <- tbl(
   conn$pgsdo,
   sql("SELECT * FROM econ.crosswalk_region")
 )
 
-crosswalks$region_tbl <- crosswalks$region |>
+xwalk_region_tbl <- xwalk_region |>
   collect()
+
+
+# read in naics hierarchy crosswalk from excel file
+xwalk_naics <- pull_db_table("xwalk", "naics")
+
+# load crosswalk for NAICS codes
+xwalk_naics_years <- pull_db_table("xwalk", "naics_long_year")
+
 
 ```
 
@@ -108,925 +118,70 @@ The first step in the process is to estimate the total number of jobs in Colorad
 
 ## QCEW
 
-First QCEW data is downloaded and processed for all years. QCEW data is accessed using the [BLS QCEW CSV Data Slices](https://www.bls.gov/cew/additional-resources/open-data/csv-data-slices.htm) system for accessing CSVs. Data can be downloaded as CSV files using the URL format https://data.bls.gov/cew/data/api/{YEAR}/{QTR}/area/{FIPS5}.csv, where `{YEAR}` is the year of the analysis, starting in 1990 to current, `{QTR}` is `1-4` for a given quarter, or `a` for annual average, and `{FIPS5}` is the 5 digit state plus county FIPS code. A script is provided to download and process the QCEW data for all years, and is available in `r_scripts/process_qcew.R`. The script downloads the data, processes it, and stores it in a DuckDB database `data/qcew.duckdb` for further analysis. Since the process is time consuming, the script is not run in this document, but is available for reference. A Google Drive folder is used for backing up date including both the [raw data](https://drive.google.com/open?id=1xNJTL7PMTY0wDlIUqWh3eE931s62vbh2&usp=drive_fs), and the [processed DuckDB database]().
+QCEW data is comes from the QCEW microdata provided to the SDO by LMI. Full documentation can be found for the QCEW processing, but the general methodology is to assign a full NAICS crosswalk to the 6 digit industry NAICS provided by LMI, and calculate the total annual jobs by county and NAICS code for all private industries. Government jobs are also aggregated, and assigned their own NAICS codes for analysis, breaking them into local government, state government, and federal government. The QCEW data is processed using SQL queries in the DuckDB database, and then further processed in R to create a combined series of employment and income data for both wage and salary jobs and sole proprietor jobs.
 
-```{r}
+The processed data included in this database has not yet been supressed and so *SHOULD NOT BE SHARED OUTSIDE OF THE SDO* without further processing to suppress data as needed. The data stored in the table `qcew_views.total_emp` is the fully processed data, and includes data on industry total employment (`ws`) and wages (`inc`), as well as total firms, and largest firm size. Employment is used to calculate total employment and wages are included for calculations in assigning jobs to base industries. 
+
+``` {r}
 #| label: process_qcew
 
-# source the processing script (uncomment to source)
-# source("r_scripts/process_qcew.R")
+qcew_data <- tbl(conn$qcew, "qcew_views.estimates_emp") |> 
+  rename(ws = employment)
 
-```
+# Check to make sure there are not duplicate records for any year, area_id, and naics combinations
+qcew_data |> 
+  count(year, area_id, naics) |> 
+  filter(n > 1)
 
-```{r}
-#| label: load_qcew
-
-# create list for storing local qcew info
-qcew <- list()
-
-# create a table of raw qcew data
-qcew$raw <- read_csv_duckdb("data/qcew_lmi.csv", prudence = "lavish") |>
-  rename_all(tolower) |>
-  select(
-    year = periodyear,
-    county_fips,
-    countyname = areaname,
-    own_code = ownership,
-    own_title = ownershipdesc,
-    ind_code = code,
-    ind_title = title,
-    estab,
-    avg_emp = avgemp,
-    tot_wage = totwage,
-    top_emp_av = topempav,
-    avg_wk_wage = avgwkwage,
-    tax_wage = taxwage,
-    contrib:realsuppress
-  )
-
-# read in naics hierarchy crosswalk from excel file
-crosswalks$naics <- map(
-  readxl::excel_sheets(
-    "data/crosswalks/bls/qcew-naics-hierarchy-crosswalk.xlsx"
-  ),
-  \(x) {
-    read_excel(
-      "data/crosswalks/bls/qcew-naics-hierarchy-crosswalk.xlsx",
-      col_types = "text",
-      sheet = x
-    ) |>
-      mutate(naics_version = x, .before = 1)
-  }
-) |>
-  bind_rows()
-
-crosswalks$naics_lvls <- crosswalks$naics |>
-  select(
-    naics_version,
-    ends_with("_code")
+# create list of wage and salary job changes to use to advance jobs by one year based on pct change
+qcew_changes <- qcew_data |>
+  filter(
+    lvl <= 3
   ) |>
-  rename(naics2_code = sector_code) |>
-  pivot_longer(
-    cols = -naics_version,
-    names_to = "ind_lvl",
-    values_to = "ind_code"
+  select(
+    year,
+    area_id,
+    naics,
+    ws
   ) |>
-  filter(str_detect(ind_lvl, "naics")) |>
-  mutate(ind_lvl = str_remove_all(ind_lvl, "(naics)|(_code)")) |>
-  distinct()
-
-
-```
-
-```{r}
-#| label: load_naics_yr_crosswalk
-
-# load crosswalk for NAICS codes
-crosswalks$naics_years <- read_csv_duckdb(
-  "data/crosswalks/xwalk_qcew_naics_year.csv"
-) |>
-  mutate(naics_version = paste0("v", as.character(naics_year))) |>
-  select(-naics_year) |>
-  left_join(
-    crosswalks$naics_lvls
-  )
-
-```
-
-```{r}
-#| label: fill_suppressed_qcew
-fn$make_qcew_data <- function() {
-  qcew$data <- qcew$raw |>
-    arrange(county_fips, ind_code, own_code, year) |>
-    # replace s; with NA
-    mutate(
-      across(
-        avg_emp:contrib,
-        ~ if_else(estab == 0, '0', .x)
-      ),
-      across(
-        avg_emp:contrib,
-        ~ na_if(.x, "s;")
-      ),
-      across(
-        avg_emp:contrib,
-        as.numeric
-      )
-    ) |>
-    left_join(
-      crosswalks$naics_years,
-      by = c("year", "ind_code")
-    ) |>
-    left_join(
-      crosswalks$region_tbl |>
-        filter(region <= 14) |>
-        select(
-          county_fips,
-          region_code
-        )
-    ) |>
-    mutate(
-      ind_lvl = if_else(
-        ind_code %in% c("00", "10"),
-        "0",
-        ind_lvl
-      )
-    ) |>
-    filter(ind_lvl %in% c("0", "1", "2")) |>
-    arrange(year, county_fips, ind_code, own_code) |>
-    mutate(
-      final_suppress = suppress,
-      final_avg_emp = avg_emp,
-      override_flag = 0,
-      override_reason = NA_character_
-    ) |>
-    collect()
-}
-qcew$data <- fn$make_qcew_data()
-# qcew$data_no_overrides <- fn$make_qcew_data()
-
-```
-
-## Filling suppressed values
-
-We estimate suppressed values through an iterative process. Prior to this process we first have to check that the suppression flag is consistent, as we replaced "s;" values with NA.
-
-```{r}
-#verify that all suppressed values have a supression code == 1
-# qcew$raw |>
-#   filter(avg_emp == "s;" & suppress != 1) |>
-#   count()
-
-```
-
-The process for filling suppressed values is as follows: 1. Create a new table in qcew$suppresss to store the suppressed values.
-2. Filter the suppression table to only include those rows that are being updated.
-3. Create three new columns in the suppressed table - temp_flag, temp_reason, and temp_value. Set the temp_flag to 1, and provide a reason for the override in temp_reason. Set temp_value to the new value for avg_emp.
-4. Join the suppressed values back to the main qcew$data table 5. Update the qcew$data table by replacing avg_emp with temp_value, suppress with 0, the override_flag to be the value from temp_flag, and the override_reason to be the value from temp_reason.
-6. Remove the temp columns from the main qcew$data table.
-
-A function has been created to do this process, `fn$apply_suppression_overrides`, which takes the suppressed table as one argument, and the override_reason as a second argument, and applies the overrides to the main qcew\$data table. This function is called after each step in the process to apply the overrides.
-
-```{r}
-#| label: create_function_apply_overrides
-
-# fn$suppression_override <- function(suppression_df, output_df) {
-#   output_df |>
-#     left_join(
-#       suppression_df |>
-#         select(
-#           # any_of(c(
-#           year,
-#           county_fips,
-#           ind_code,
-#           own_code,
-#           temp_flag,
-#           temp_reason,
-#           temp_value
-#           # ))
-#         ) |>
-#         mutate(final_suppress = 1)
-#     ) |>
-#     mutate(
-#       final_avg_emp = if_else(!is.na(temp_flag), temp_value, final_avg_emp),
-#       final_suppress = if_else(!is.na(temp_flag), 0, final_suppress),
-#       override_flag = if_else(!is.na(temp_flag), temp_flag, override_flag),
-#       override_reason = if_else(!is.na(temp_flag), temp_reason, override_reason)
-#     ) |>
-#     select(-starts_with("temp_"))
-# }
-
-# fn$check_overrides <- function(df) {
-#   df |>
-#     filter(final_suppress == 1 | override_flag == 1) |>
-#     count(override_reason, sort = TRUE)
-# }
-
-```
-
-### Industry Code `00` vs `10`
-
-Prior to starting this procedure industry codes `00` and `10` were compared for equivalency and to determine if one could be used all the time over the other, or if they were circumstantially dependent. This was done by comparing the two industries and looking for differences where one was greater than the other.
-
-```{r}
-#| label: compare_ind_codes
-
-# qcew$checks$ind_code <- qcew$data |>
-#   filter(ind_code %in% c("00", "10")) |>
-#   select(year, county_fips, ind_code, own_code, avg_emp = final_avg_emp) |>
-#   pivot_wider(
-#     names_from = ind_code,
-#     values_from = c(avg_emp),
-#     names_glue = "{.value}_{ind_code}"
-#   ) |>
-#   mutate(
-#     diff = avg_emp_10 - avg_emp_00,
-#     diff_flag = case_when(
-#       is.na(avg_emp_10) & !is.na(avg_emp_00) ~ "10 NA",
-#       !is.na(avg_emp_10) & is.na(avg_emp_00) ~ "00 NA",
-#       is.na(diff) ~ "Both NA",
-#       diff > 0 ~ "10 > 00",
-#       diff < 0 ~ "00 > 10",
-#       diff == 0 ~ "Equal"
-#     )
-#   )
-
-# qcew$checks$ind_code |>
-#   count(diff_flag, sort = TRUE)
-
-```
-
-They were found to be the same however there were a number of circumstances where 10 was NA and 00 was not, or vice versa. The number with 10 NA was much greater so 00 was used but first the missing NAs available in 10 but not 00 were filled into 00. Code `10` was then filtered out of the data for the remainder of the analysis.
-
-```{r}
-#| label: fill_ind_code_00
-
-# qcew$suppress$ind_code <- qcew$checks$ind_code |>
-#   filter(diff_flag == "00 NA") |>
-#   select(year, county_fips, own_code, temp_value = avg_emp_10) |>
-#   mutate(
-#     ind_code = "00",
-#     temp_flag = 1,
-#     temp_reason = "Filled from ind_code 10"
-#   )
-
-# qcew$data <- fn$suppression_override(qcew$suppress$ind_code, qcew$data)
-
-# qcew$data <- qcew$data |>
-#   filter(ind_code != "10")
-
-# fn$check_overrides(qcew$data)
-```
-
-### Government Jobs
-
-As the count is identified as 0, we move on to the next step. Here we check to see that total government jobs are not suppressed for any county at each the state, local and federal level, and that the sum of the ownership groups equals the group total. If these are both the case then we can focus only on private ownership (own_code == 50) as we only look at government totals in our analysis.
-
-```{r}
-#| label: suppression_gov
-
-# qcew$suppress$gov <- qcew$data |>
-#   filter(
-#     own_code %in%
-#       c("10", "20", "30", "50") &
-#       ind_code %in% c("00")
-#   ) |>
-#   summarize(
-#     total_gov_calc = sum(avg_emp, na.rm = TRUE),
-#     total_suppressed = sum(suppress, na.rm = TRUE),
-#     .by = c(year, county_fips, ind_code)
-#   ) |>
-#   left_join(
-#     qcew$data |>
-#       filter(
-#         own_code == "00" &
-#           ind_code %in% c("00")
-#       ) |>
-#       select(year, county_fips, ind_code, total_gov_reported = avg_emp),
-#     by = join_by(year, county_fips, ind_code)
-#   ) |>
-#   mutate(
-#     temp_value = total_gov_reported - total_gov_calc,
-#     temp_flag = 1,
-#     temp_reason = "Government Total Suppressed"
-#   ) |>
-#   filter(total_suppressed > 0) |>
-#   arrange(year, county_fips) |>
-#   left_join(
-#     qcew$data |>
-#       select(year, county_fips, ind_code, own_code, suppress) |>
-#       filter(
-#         own_code %in%
-#           c("10", "20", "30", "50") &
-#           ind_code %in% c("00") &
-#           suppress == 1
-#       ),
-#     by = join_by(year, county_fips, ind_code),
-#     relationship = "one-to-one"
-#   ) |>
-#   relocate(own_code, .before = ind_code)
-
-```
-
-While some government groups are suppressed there is only one government type suppressed per county, year, industry code (there are both code "00" and "10" that have totals), and there is a difference between the sum of all ownership classes (State, Local, Federal, Private) and the reported total. As such we can fill in the suppressed government values as the difference between the reported total and the sum of the other ownership classes.
-
-```{r}
-#| label: override_gov_suppression
-
-# #apply overrides
-# qcew$data <- fn$suppression_override(qcew$suppress$gov, qcew$data)
-
-# # verify that sum of state local federal and private equals total for all groupings
-# qcew$data |>
-#   filter(
-#     own_code %in%
-#       c("10", "20", "30", "50") &
-#       ind_code %in% c("00")
-#   ) |>
-#   summarize(
-#     total_gov_calc = sum(avg_emp, na.rm = TRUE),
-#     total_suppressed = sum(suppress, na.rm = TRUE),
-#     .by = c(year, county_fips, ind_code)
-#   ) |>
-#   left_join(
-#     qcew$data |>
-#       filter(
-#         own_code == "00" &
-#           ind_code %in% c("00")
-#       ) |>
-#       select(year, county_fips, ind_code, total_gov_reported = avg_emp)
-#   ) |>
-#   mutate(
-#     diff = total_gov_reported - total_gov_calc
-#   ) |>
-#   filter(abs(diff) >= 10) |>
-#   arrange(year, county_fips)
-
-# # check overrides
-# fn$check_overrides(qcew$data)
-
-```
-
-### Private Jobs
-
-A separate data frame is created for the next steps in the process using only private ownership. This is for simplicity in creating and tracking data and will be rejoined with the government data at the end of the process.
-
-```{r}
-#| label: filter_private_ownership
-
-# qcew$data_gov <- qcew$data |>
-#   filter(own_code != "50")
-
-# fn$calc_industry_gaps <- function(df) {
-#   df |>
-#     select(
-#       -any_of(c(
-#         "ind_emp_reported",
-#         "ind_emp_calculated",
-#         "ind_emp_gap",
-#         "ind_supressed"
-#       ))
-#     ) |>
-#     filter(own_code == "50") |>
-#     left_join(
-#       df |>
-#         filter(own_code == "50" & ind_code == "00") |>
-#         select(
-#           year,
-#           county_fips,
-#           ind_emp_reported = final_avg_emp
-#         )
-#     ) |>
-#     left_join(
-#       df |>
-#         filter(own_code == "50" & !ind_code == "00") |>
-#         summarize(
-#           ind_emp_calculated = sum(final_avg_emp, na.rm = TRUE),
-#           ind_supressed = sum(final_suppress, na.rm = TRUE),
-#           .by = c(year, county_fips)
-#         )
-#     ) |>
-#     mutate(ind_emp_gap = ind_emp_reported - ind_emp_calculated) |>
-#     arrange(county_fips, ind_code, year)
-# }
-
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data)
-
-```
-
-#### No job gap
-
-First we check to see if there are any counties where the total private jobs (ind_code == "00") is not suppressed, and the sum of all other industries equals the total. If this is the case then any suppressed values can be filled with 0 jobs. This is done to avoid accidentally filling jobs in later steps when there is no job gap to fill.
-
-```{r}
-#| label: suppression_adjust_no_gap
-
-# qcew$suppress$no_gap <- qcew$data_private |>
-#   filter(ind_emp_gap <= 0 & ind_supressed > 0 & final_suppress == 1) |>
-#   select(year, county_fips, ind_code, own_code) |>
-#   mutate(
-#     temp_value = 0,
-#     temp_flag = 1,
-#     temp_reason = "No Job Gap - Filled with 0"
-#   )
-
-# #apply overrides
-# qcew$data_private <- fn$suppression_override(
-#   qcew$suppress$no_gap,
-#   qcew$data_private
-# )
-
-# # update industry gaps
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# fn$check_overrides(qcew$data_private)
-
-```
-
-#### Zero Establishments
-
-Next we replace all suppressed values with 0 establishments to have zero employees, and then if there is only one remaining missing NAICS value for that area we fill that as the difference between the parent total and the sum of the other industries. Columns are added to indicate if suppression was overwritten, the override reason, and the new value. Grouped data frames using group_by are used, rather than within mutate, as the same groupings will be used for the next number of steps.
-
-For now we are only calculating these based on the own_code
-
-```{r}
-#| label: suppression_adjust_0_estab
-
-# qcew$suppress$no_estabs <- qcew$data_private |>
-#   filter(own_code == "50" & ind_supressed == "1" & final_suppress == "1") |>
-#   mutate(
-#     temp_value = max(ind_emp_gap, 0),
-#     temp_flag = 1,
-#     temp_reason = "Only Missing Industry",
-#     .by = c(year, county_fips, ind_code)
-#   ) |>
-#   select(
-#     year,
-#     county_fips,
-#     ind_code,
-#     own_code,
-#     final_suppress,
-#     temp_value,
-#     temp_flag,
-#     temp_reason
-#   )
-
-# #apply overrides
-# qcew$data_private <- fn$suppression_override(
-#   qcew$suppress$no_estabs,
-#   qcew$data_private
-# )
-
-# # update industry gaps
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# # check overrides
-# fn$check_overrides(qcew$data_private)
-
-```
-
-### Interpolation
-
-Next we do a simple linear interpolation for any remaining suppressed values, using the imputeTS::na_interpolation function with a max_gap of 2 (so this does not fill overly long gaps).
-
-```{r}
-#| label: simple_interpolation
-
-# qcew$suppress$simple_interp <- qcew$data_private |>
-#   arrange(county_fips, ind_code, own_code, year) |>
-#   mutate(
-#     na_count = sum(is.na(final_avg_emp)),
-#     n_years = n(),
-#     all_na = na_count >= n_years - 1,
-#     .by = c(county_fips, ind_code, own_code)
-#   ) |>
-#   filter(!all_na) |>
-#   mutate(
-#     init_value = if_else(
-#       final_suppress == 1,
-#       na_interpolation(final_avg_emp, option = "linear", maxgap = 5),
-#       NA
-#     ),
-#     temp_flag = if_else(!is.na(init_value), 1, NA_real_),
-#     temp_reason = if_else(
-#       !is.na(init_value),
-#       "Simple Linear Interpolation",
-#       NA_character_
-#     ),
-#     .by = c(county_fips, ind_code)
-#   ) |>
-#   # adjust for county totals
-#   mutate(
-#     init_total = sum(init_value, na.rm = TRUE),
-#     init_share = if_else(
-#       init_total > 0,
-#       init_value / init_total,
-#       0
-#     ),
-#     init_count = sum(temp_flag == 1, na.rm = TRUE),
-#     init_suppress = sum(final_suppress),
-#     init_allocate_all = init_count == init_suppress,
-#     .by = c(year, county_fips)
-#   ) |>
-#   #adjust temp_value to not be larger than the employment gap
-#   mutate(
-#     temp_value = round(
-#       if_else(
-#         !is.na(init_value) & (init_allocate_all | init_total >= ind_emp_gap),
-#         ind_emp_gap * init_share,
-#         init_value
-#       ),
-#       0
-#     ),
-#   ) |>
-#   select(
-#     year,
-#     county_fips,
-#     countyname,
-#     own_code,
-#     ind_code,
-#     ind_title,
-#     estab,
-#     final_avg_emp,
-#     ind_emp_reported,
-#     ind_emp_calculated,
-#     ind_emp_gap,
-#     final_suppress,
-#     temp_value,
-#     temp_flag,
-#     temp_reason,
-#     starts_with("init_")
-#   ) |>
-#   arrange(
-#     county_fips,
-#     ind_code,
-#     year
-#   ) |>
-#   filter(temp_flag == 1) |>
-#   mutate(
-#     final_total = sum(temp_value, na.rm = TRUE),
-#     .by = c(year, county_fips),
-#     .after = ind_emp_gap
-#   )
-
-# #apply overrides
-# qcew$data_private <- fn$suppression_override(
-#   qcew$suppress$simple_interp,
-#   qcew$data_private
-# )
-
-# # update industry gaps
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# # fill 1 remaining suppressed gaps
-# qcew$data_private <- qcew$data_private |>
-#   mutate(
-#     final_avg_emp = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       ind_emp_gap,
-#       final_avg_emp
-#     ),
-#     override_flag = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       1,
-#       override_flag
-#     ),
-#     override_reason = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       "Fill Single Industry - Interpolation",
-#       override_reason
-#     ),
-#     final_suppress = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       0,
-#       final_suppress
-#     ),
-#   )
-
-# # update industry gaps
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# # check overrides
-# fn$check_overrides(qcew$data_private)
-
-```
-
-### Region Shares
-
-Next we calculate the share of employment by industry within the region, and allocate the remaining job gaps based on those shares.
-
-```{r}
-#| label: region_shares
-
-# # calculate region shares
-# qcew$suppress$region_shares <- qcew$data_private |>
-#   filter(ind_supressed == 0) |>
-#   summarize(
-#     ind_emp_region = sum(final_avg_emp, na.rm = FALSE),
-#     total_emp_region = sum(ind_emp_reported, na.rm = FALSE),
-#     ind_share_region = ind_emp_region / total_emp_region,
-#     .by = c(year, ind_code, region_code)
-#   ) |>
-#   arrange(year, region_code, ind_code) |>
-#   mutate(
-#     total_industries = n(),
-#     .by = c(year, region_code)
-#   )
-
-# # check that region shares sum to 1
-# qcew$suppress$region_shares |>
-#   filter(ind_code != "00") |>
-#   summarize(
-#     total = sum(ind_share_region, na.rm = TRUE),
-#     .by = c(year, region_code)
-#   ) |>
-#   filter(abs(total - 1) > 0.01)
-
-# # allocate remaining gaps based on region shares
-# qcew$suppress$region_allocate <- qcew$data_private |>
-#   filter(final_suppress == 1) |>
-#   left_join(
-#     qcew$suppress$region_shares,
-#     by = c("year", "ind_code", "region_code")
-#   ) |>
-#   mutate(
-#     temp_value = round(ind_emp_gap * ind_share_region, 0),
-#     temp_flag = if_else(!is.na(temp_value), 1, NA_real_),
-#     temp_reason = if_else(
-#       !is.na(temp_value),
-#       "Region Share Allocation",
-#       NA_character_
-#     ),
-#     .by = c(year, county_fips)
-#   ) |>
-#   select(
-#     year,
-#     county_fips,
-#     ind_code,
-#     own_code,
-#     final_suppress,
-#     temp_value,
-#     temp_flag,
-#     temp_reason
-#   ) |>
-#   filter(!is.na(temp_value))
-
-# #apply overrides
-# qcew$data_private <- fn$suppression_override(
-#   qcew$suppress$region_allocate,
-#   qcew$data_private
-# )
-
-# # update industry gaps
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# # fill 1 remaining suppressed gaps
-# qcew$data_private <- qcew$data_private |>
-#   mutate(
-#     final_avg_emp = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       ind_emp_gap,
-#       final_avg_emp
-#     ),
-#     override_flag = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       1,
-#       override_flag
-#     ),
-#     override_reason = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       "Fill Single Industry - Region Share",
-#       override_reason
-#     ),
-#     final_suppress = if_else(
-#       final_suppress == 1 & ind_supressed == 1,
-#       0,
-#       final_suppress
-#     ),
-#   )
-
-# # update industry gaps
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# # check overrides
-# fn$check_overrides(qcew$data_private)
-
-```
-
-Finally this is repeated with state shares for the remaining gaps.
-
-```{r}
-#| label: state_shares
-
-# # calculate state shares
-# qcew$suppress$state_shares <- qcew$data_private |>
-#   filter(county_fips == "000") |>
-#   summarize(
-#     ind_emp_state = sum(final_avg_emp, na.rm = FALSE),
-#     total_emp_state = sum(ind_emp_reported, na.rm = FALSE),
-#     ind_share_state = ind_emp_state / total_emp_state,
-#     .by = c(year, ind_code)
-#   ) |>
-#   arrange(year, ind_code) |>
-#   mutate(
-#     total_industries = n(),
-#     .by = c(year)
-#   )
-
-# # check that state shares sum to 1
-# qcew$suppress$state_shares |>
-#   filter(ind_code != "00") |>
-#   summarize(total = sum(ind_share_state, na.rm = TRUE), .by = c(year)) |>
-#   filter(abs(total - 1) > 0.01)
-
-# # allocate remaining gaps based on state shares
-# qcew$suppress$state_allocate <- qcew$data_private |>
-#   filter(final_suppress == 1) |>
-#   left_join(
-#     qcew$suppress$state_shares,
-#     by = c("year", "ind_code")
-#   ) |>
-#   mutate(
-#     temp_value = round(ind_emp_gap * ind_share_state, 0),
-#     temp_flag = if_else(!is.na(temp_value), 1, NA_real_),
-#     temp_reason = if_else(
-#       !is.na(temp_value),
-#       "State Share Allocation",
-#       NA_character_
-#     ),
-#     .by = c(year, county_fips)
-#   ) |>
-#   select(
-#     year,
-#     county_fips,
-#     ind_code,
-#     own_code,
-#     final_suppress,
-#     temp_value,
-#     temp_flag,
-#     temp_reason
-#   ) |>
-#   filter(!is.na(temp_value))
-
-# #apply overrides
-# qcew$data_private <- fn$suppression_override(
-#   qcew$suppress$state_allocate,
-#   qcew$data_private
-# )
-
-# # update industry gaps
-
-# qcew$data_private <- fn$calc_industry_gaps(qcew$data_private)
-
-# # check overrides
-
-# fn$check_overrides(qcew$data_private)
+  arrange(year, area_id, naics) |>
+  group_by(area_id, naics) |>
+  mutate(
+    area_id = paste0("08", area_id),
+    naics = if_else(naics == "00", "10", naics),
+    ws_change = if_else(lag(ws) == 0, 0, (ws - lag(ws)) / lag(ws)),
+    ws_change = if_else(is.na(ws_change), 0, ws_change)
+  ) |>
+  ungroup() |>
+  select(-ws)
 
 ```
 
 # Sole Proprietors
 
-```{r}
-#| label: load_nes_years
 
-# create nes list
-nes <- list()
-
-# get available years using censusapi
-nes$info <- listCensusApis() |>
-  filter(name == "nonemp")
-
-nes$yrs$raw <- nes$info |>
-  pull(vintage)
-
-```
-
-Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(nes$yrs$raw)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code. The NAICS code is renamed to `ind_code`[^2] to match the QCEW data, and use the `own_code` of `1` to indicate sole proprietors. The NES data is then stored in the DuckDB database for further analysis.
+Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(nes$yrs$raw)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code. The NAICS code is renamed to `naics`[^2] to match the QCEW data, and use the `own_code` of `1` to indicate sole proprietors. The NES data is then stored in the DuckDB database for further analysis.
 
 [^2]: As there are not strict concordances between NAICS years we leave these classified as they were at the time - as with the QCEW. At the industry level there should be minimal changes. The one exception to align with the QCEW is that the QCEW utilizes 2002 NAICS codes for all years prior to . 1997 to 2002 concordances were used, allocating evenly.
 
 ```{r}
 #| label: load_nes
 
-# load NES variables for most recent year
-nes$vars <- listCensusMetadata(
-  name = "nonemp",
-  vintage = max(nes$yrs$raw),
-  type = "variables"
-)
-
-fn$get_nes_data <- function(vintage) {
-  # get list of variables for vintage
-  nes$vars <- listCensusMetadata(
-    name = "nonemp",
-    vintage = vintage,
-    type = "variables"
-  ) |>
-    filter(
-      is.na(predicateOnly) &
-        !(name %in% c("STATE", "COUNTY"))
-    ) |>
-    pull(name)
-
-  # get NES data for a given year
-  data <- getCensus(
-    name = "nonemp",
-    vintage = vintage,
-    vars = nes$vars,
-    region = "county:*",
-    regionin = "state:08"
-  ) |>
-    mutate(
-      vintage = vintage,
-      .before = 1
-    ) |>
-    # rename variables to lowercase
-    rename_with(tolower) |>
-    # rename naics to match QCEW
-    rename_with(
-      ~"ind_code",
-      matches("naics\\d{2,4}$")
-    )
-
-  return(data)
-}
-
-nes$raw <- tbl(conn$qcew, "nes") |>
-  distinct() |>
-  arrange(vintage, state, industry_code, county) |>
-  collect()
-
-nes$yrs$db <- nes$raw |>
-  pull(vintage) |>
-  unique()
-
-nes$yrs$qry <- nes$info |>
-  select(vintage) |>
-  filter(vintage >= 2000 & !(vintage %in% nes$yrs$db)) |>
-  pull(vintage) |>
-  unique()
-
-# Store NES data in DuckDB
-dbWriteTable(
-  conn$qcew,
-  "nes",
-  map(
-    nes$yrs$qry,
-    fn$get_nes_data,
-    .progress = TRUE
-  ) |>
-    bind_rows(),
-  append = TRUE
-)
-
-# Create crosswalk for NES data
-crosswalks$nes <- nes$raw |>
-  collect() |>
-  select(industry_code, sector, subsector, indlevel) |>
-  distinct() |>
-  arrange(industry_code)
-
-
-# Create table of relevant NES data
-nes$data <- nes$raw |>
-  mutate(
-    area_fips = paste0(state, county),
-    own_code = "5", # treat sole props as private,
-    industry_code = if_else(
-      industry_code == "00",
-      "10",
-      industry_code
-    ),
-    year = vintage
-  ) |>
-  rename(
-    ind_code = industry_code
-  ) |>
-  left_join(
-    crosswalks$naics_years
-  ) |>
-  select(
-    year = vintage,
-    area_fips,
-    own_code,
-    ind_code,
-    ind_lvl,
-    prop = nestab,
-    inc = nrcptot,
-    f_prop = nestab_f,
-    f_inc = nrcptot_f
-  ) %>%
-  # distinct() |>
-  bind_rows(
-    . |>
-      mutate(
-        area_fips = "08000", # Colorado total
-      ) |>
-      summarize(
-        across(
-          starts_with(c("prop", "inc")),
-          ~ sum(.x, na.rm = FALSE)
-        ),
-        .by = c("year", "area_fips", "ind_code", "ind_lvl", "own_code")
-      )
-  ) |>
-  arrange(year, area_fips, ind_code, own_code)
 
 
 ```
 
 # Additional Series
 
-Additional series are added to the estimates as they become available. These series include 
-- Agriculture estimates from the Census of Ag
-- Military Employment estimates from the Department of Defense
+Additional series are added to the estimates as they become available. These series include - Agriculture estimates from the Census of Ag - Military Employment estimates from the Department of Defense
 
 # Census of Agriculture
+
 Data from the [Census of Agriculture](https://www.nass.usda.gov/Publications/AgCensus/2022/index.php) is accessed using the USDA NASS API. An API key is required to access the data, which can be obtained from the [NASS Quick Stats API](https://quickstats.nass.usda.gov/api). The API key is stored in the `.Renviron` file for secure access. A function is created to retrieve data from the NASS API based on various parameters such as source description, sector description, group description, commodity description, statistic category description, state alpha code, aggregation level description, and year. The data is retrieved in CSV format and read into a data frame for further analysis.
 
-``` {r}
+```{r}
 #| label: load_census_of_ag
-source("r_scripts/nass_scripts.R")
+# source("r_scripts/nass_scripts.R")
 
 ```
 
@@ -1035,135 +190,134 @@ Data is pulled to get the total number of farm owners, and total farm related em
 ```{r}
 #| label: get_census_of_ag_data
 
-census_of_ag <- read_csv_duckdb(
-  "data/inputs/census_of_ag/*",
-  prudence = "lavish"
-) |>
-  filter(STATE_ALPHA == "CO")
+# census_of_ag <- read_csv_duckdb(
+#   "data/inputs/census_of_ag/*",
+#   prudence = "lavish"
+# ) |>
+#   filter(STATE_ALPHA == "CO")
 
 
-ag_prop <- census_of_ag |>
-  filter(
-    str_detect(SHORT_DESC, "PRIMARY OCCUPATION, FARMING"),
-    str_detect(CLASS_DESC, "ALL"),
-    # str_detect(UNIT_DESC, "OPERAT"),
-    str_detect(DOMAIN_DESC, "TOTAL"),
-    !(YEAR == 2017 & COMMODITY_DESC == "PRODUCERS")
-  ) |>
-  collect()
-ag_prop <- ag_prop |>
-  mutate(
-    COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE)
-  ) |>
-  filter(
-    !(COUNTY_CODE == "000" &
-      YEAR %in% c("2007", "2012") &
-      SHORT_DESC !=
-        "OPERATORS, PRINCIPAL, PRIMARY OCCUPATION, FARMING - NUMBER OF OPERATORS"),
-    !(COUNTY_CODE == "000" &
-      YEAR %in% c("2017") &
-      SHORT_DESC !=
-        "PRODUCERS, PRINCIPAL, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
-    !(COUNTY_CODE == "000" &
-      YEAR %in% c("2022") &
-      SHORT_DESC !=
-        "PRODUCERS, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
-      !is.na(COUNTY_CODE)
-  )
+# ag_prop <- census_of_ag |>
+#   filter(
+#     str_detect(SHORT_DESC, "PRIMARY OCCUPATION, FARMING"),
+#     str_detect(CLASS_DESC, "ALL"),
+#     # str_detect(UNIT_DESC, "OPERAT"),
+#     str_detect(DOMAIN_DESC, "TOTAL"),
+#     !(YEAR == 2017 & COMMODITY_DESC == "PRODUCERS")
+#   ) |>
+#   collect()
+# ag_prop <- ag_prop |>
+#   mutate(
+#     COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE)
+#   ) |>
+#   filter(
+#     !(COUNTY_CODE == "000" &
+#       YEAR %in% c("2007", "2012") &
+#       SHORT_DESC !=
+#         "OPERATORS, PRINCIPAL, PRIMARY OCCUPATION, FARMING - NUMBER OF OPERATORS"),
+#     !(COUNTY_CODE == "000" &
+#       YEAR %in% c("2017") &
+#       SHORT_DESC !=
+#         "PRODUCERS, PRINCIPAL, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
+#     !(COUNTY_CODE == "000" &
+#       YEAR %in% c("2022") &
+#       SHORT_DESC !=
+#         "PRODUCERS, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
+#     !is.na(COUNTY_CODE)
+#   )
 
 
+# ag_ws <- census_of_ag |>
+#   filter(
+#     SECTOR_DESC == "ECONOMICS",
+#     GROUP_DESC == "EXPENSES",
+#     COMMODITY_DESC == "LABOR",
+#     STATISTICCAT_DESC == "WORKERS",
+#     DOMAIN_DESC == "TOTAL",
+#     UNIT_DESC == "NUMBER",
+#     str_detect(CLASS_DESC, "GT 150|GE 150")
+#   ) |>
+#   collect()
+# ag_ws <- ag_ws |>
+#   mutate(COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE))
 
-ag_ws <- census_of_ag |>
-  filter(
-    SECTOR_DESC == "ECONOMICS",
-    GROUP_DESC == "EXPENSES",
-    COMMODITY_DESC == "LABOR",
-    STATISTICCAT_DESC == "WORKERS",
-    DOMAIN_DESC == "TOTAL",
-    UNIT_DESC == "NUMBER",
-    str_detect(CLASS_DESC, "GT 150|GE 150")
-  ) |>
-  collect()
-ag_ws <- ag_ws |>
-  mutate(COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE))
+# # interpolate data to fill in missing years using VALUE column
 
-# interpolate data to fill in missing years using VALUE column
+# # Prepare agriculture data: clean values and convert to numeric
+# # First get all county-year combinations from the census years
+# census_years <- distinct(ag_prop, YEAR)
+# all_counties <- distinct(ag_prop, COUNTY_CODE, COUNTY_NAME) |>
+#   arrange(COUNTY_CODE)
 
-# Prepare agriculture data: clean values and convert to numeric
-# First get all county-year combinations from the census years
-census_years <- distinct(ag_prop, YEAR)
-all_counties <- distinct(ag_prop, COUNTY_CODE, COUNTY_NAME) |>
-  arrange(COUNTY_CODE)
+# ag_combined <- expand_grid(census_years, all_counties) |>
+#   left_join(
+#     ag_prop |>
+#       mutate(
+#         VALUE = na_if(
+#           VALUE,
+#           "(D)"
+#         ),
+#         prop = as.numeric(str_remove_all(VALUE, ","))
+#       ) |>
+#       select(YEAR, COUNTY_CODE, COUNTY_NAME, COMMODITY_DESC, SHORT_DESC, prop)
+#   ) |>
+#   left_join(
+#     ag_ws |>
+#       mutate(
+#         COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE),
+#         VALUE = na_if(
+#           VALUE,
+#           "(D)"
+#         ),
+#         ws = as.numeric(str_remove_all(VALUE, ","))
+#       ) |>
+#       select(YEAR, COUNTY_CODE, COUNTY_NAME, ws)
+#   ) |>
+#   mutate(
+#     across(c(prop, ws), ~ replace_na(.x, 0)),
+#     jobs = prop + ws,
+#   ) |>
+#   arrange(COUNTY_CODE, YEAR)
 
-ag_combined <- expand_grid(census_years, all_counties) |>
-  left_join(
-    ag_prop |>
-      mutate(
-        VALUE = na_if(
-          VALUE,
-          "(D)"
-        ),
-        prop = as.numeric(str_remove_all(VALUE, ","))
-      ) |>
-      select(YEAR, COUNTY_CODE, COUNTY_NAME, COMMODITY_DESC, SHORT_DESC, prop)
-  ) |>
-  left_join(
-    ag_ws |>
-      mutate(
-        COUNTY_CODE = if_else(AGG_LEVEL_DESC == "STATE", "000", COUNTY_CODE),
-        VALUE = na_if(
-          VALUE,
-          "(D)"
-        ),
-        ws = as.numeric(str_remove_all(VALUE, ","))
-      ) |>
-      select(YEAR, COUNTY_CODE, COUNTY_NAME, ws)
-  ) |>
-  mutate(
-    across(c(prop, ws), ~ replace_na(.x, 0)),
-    jobs = prop + ws,
-  ) |>
-  arrange(COUNTY_CODE, YEAR)
+# # Check for missing values and "(D)" indicators
+# ag_combined |>
+#   filter(is.na(jobs)) |>
+#   distinct(jobs)
 
-# Check for missing values and "(D)" indicators
-ag_combined |>
-  filter(is.na(jobs)) |>
-  distinct(jobs)
+# # Interpolate missing values for each county and type combination
+# ag_interp <- expand_grid(
+#   YEAR = 2001:2024,
+#   distinct(ag_combined, COUNTY_CODE, COUNTY_NAME)
+# ) |>
+#   left_join(ag_combined) |>
+#   arrange(COUNTY_CODE, YEAR) |>
+#   mutate(
+#     COUNTY_NAME = if_else(
+#       COUNTY_CODE == "000",
+#       "Colorado",
+#       COUNTY_NAME
+#     ),
+#     interp_value = imputeTS::na_interpolation(
+#       jobs,
+#       option = "linear",
+#       maxgap = 24
+#     ),
+#     naics = "11", # NAICS code for Agriculture, Forestry, Fishing and Hunting
+#     .by = c(COUNTY_CODE)
+#   ) |>
+#   fill(interp_value, .direction = "downup")
 
-# Interpolate missing values for each county and type combination
-ag_interp <- expand_grid(
-  YEAR = 2001:2024,
-  distinct(ag_combined, COUNTY_CODE, COUNTY_NAME)
-) |>
-  left_join(ag_combined) |>
-  arrange(COUNTY_CODE, YEAR) |>
-  mutate(
-COUNTY_NAME = if_else(
-      COUNTY_CODE == "000",
-      "Colorado",
-      COUNTY_NAME
-    ),
-    interp_value = imputeTS::na_interpolation(
-      jobs,
-      option = "linear",
-      maxgap = 24
-    ),
-    ind_code = "11", # NAICS code for Agriculture, Forestry, Fishing and Hunting
-    .by = c(COUNTY_CODE)
-  ) |>
-  fill(interp_value, .direction = "downup")
+# # Sum workers and proprietors to get total ag employment
+# ag_total <- ag_interp |>
+#   select(
+#     year = YEAR,
+#     area_id = COUNTY_CODE,
+#     COUNTY_NAME,
+#     naics,
+#     ag_jobs = interp_value
+#   )
 
-# Sum workers and proprietors to get total ag employment
-ag_total <- ag_interp |>
-  select(
-    year = YEAR,
-    area_fips = COUNTY_CODE,
-    COUNTY_NAME,
-    ind_code,
-    ag_jobs = interp_value
-  )
-
-write_csv(ag_total, "data/outputs/agriculture_employment.csv")
+# write_csv(ag_total, "data/outputs/agriculture_employment.csv")
 ```
 
 # Combined Series
@@ -1173,125 +327,87 @@ Next the QCEW data is joined with the NES data to create a combined table of emp
 ```{r}
 #| label: create_combined_series
 
-# create forecast data list
-fcst <- list()
-
-qcew_con <- dbConnect(
-  duckdb::duckdb(),
-  dbdir = "G:/Shared drives/SDO Econ/qcew/microdata/qcew.db",
-  read_only = FALSE
-)
-
-qcew$data <- tbl(qcew_con, "qcew_views.total_emp") |>
-  rename(
-    area_fips = cnty,
-    ind_code = naics,
-    ind_lvl = lvl,
-    ws = employment,
-    inc = wages
-  ) %>%
-  collect() %>%
+# advance proprietor jobs by one year for most recent missing year based on pct change in wage and salary jobs if there is an equivalent industry - otherwise use the last year available
+nes$data <- nes$data %>%
+  # filter(year != max(year)) %>%
   bind_rows(
     . |>
-      summarize(
-        area_fips = "000",
-        ws = sum(ws, na.rm = TRUE),
-        inc = sum(inc, na.rm = TRUE),
-        total_firms = sum(total_firms, na.rm = TRUE),
-        largest_firm = max(largest_firm, na.rm = TRUE),
-        .by = c("year", "ind_code", "ind_lvl", "own_code")
-      )
-  ) |>
-  arrange(year, area_fips, own_code, ind_code)
-
-# create list of wage and salary job changes to use to advance jobs by one year based on pct change
-qcew$changes <- qcew$data |>
-  filter(
-    ind_lvl <= 3
-  ) |>
-  select(
-    year,
-    area_fips,
-    ind_code,
-    own_code,
-    ws
-  ) |>
-  arrange(year, area_fips, ind_code, own_code) |>
-  group_by(area_fips, ind_code, own_code) |>
-  mutate(
-    area_fips = paste0("08", area_fips),
-    ind_code = if_else(ind_code == "00", "10", ind_code),
-    ws_change = if_else(lag(ws) == 0, 0, (ws - lag(ws)) / lag(ws)),
-    ws_change = if_else(is.na(ws_change), 0, ws_change)
-  ) |>
-  ungroup() |>
-  select(-ws)
-
-# advance proprietor jobs by one year for most recent missing year based on pct change in wage and salary jobs if there is an equivalent industry - otherwise use the last year available
-nes$data <- nes$data |>
-  bind_rows(
-    nes$data |>
+      filter(
+        naics != "10",
+      ) |>
       filter(year == max(year)) |>
       mutate(
         year = year + 1
       ) |>
       left_join(
-        qcew$changes,
-        by = c("area_fips", "ind_code", "own_code", "year")
+        qcew_changes,
+        by = c("area_id", "naics", "own_code", "year")
       ) |>
       mutate(
-        prop = prop * (1 + ws_change),
-        inc = inc * (1 + ws_change)
+        prop = prop * (1 + replace_na(ws_change, 0)),
+        inc = inc * (1 + replace_na(ws_change, 0))
+      ) %>%
+      bind_rows(
+        . |> 
+          filter(
+            lvl == "2"
+          ) |> 
+          summarize(
+          naics = "10",
+          lvl = "0",
+          prop = sum(prop, na.rm = TRUE),
+          inc = sum(inc, na.rm = TRUE),
+          .by = c(year, area_id, own_code)
+        )
       ) |>
       select(-ws_change)
   )
 
 # create combined series of QCEW and NES data for counties
-# fcst$tej$
-series_c <- qcew$data |>
-  relocate(ind_lvl, .after = ind_code) |>
+fcst$tej$series_c <- qcew_data |>
+  relocate(lvl, .after = naics) |>
   # add on ag data
-  left_join(
-    expand_grid(own_code = c("0", "5"), ag_total),
-    by = c("year", "area_fips", "ind_code", "own_code")
-  ) |>
+  # left_join(
+  #   expand_grid(own_code = c("0", "5"), ag_total),
+  #   by = c("year", "area_id", "naics", "own_code")
+  # ) |>
+  # mutate(
+  #   ag_jobs = if_else(
+  #     naics == "11" & !is.na(ag_jobs),
+  #     ag_jobs,
+  #     0
+  #   )
+  # ) |>
   mutate(
-    ag_jobs = if_else(
-      ind_code == "11" & !is.na(ag_jobs),
-      ag_jobs,
-      0
-    )
-  ) |>
-  mutate(
-    area_fips = paste0("08", area_fips),
+    area_id = paste0("08", area_id),
     own_code = str_sub(own_code, 1, 1),
-    ind_code = if_else(ind_code == "00", "10", ind_code),
-    ind_lvl = if_else(ind_code == "10", "0", as.character(ind_lvl))
+    naics = if_else(naics == "00", "10", naics),
+    lvl = if_else(naics == "10", "0", as.character(lvl))
   ) |>
   rename(firmws = total_firms) |>
   filter(
     own_code %in%
       c("1", "2", "3", "5") &
       year >= 2000 &
-      ind_lvl %in% c("0", "2", "3")
+      lvl %in% c("0", "2", "3")
   ) |>
   full_join(
     nes$data |>
       filter((prop + inc) > 0) |>
       mutate(
-        ind_lvl = if_else(ind_code == "10", "0", ind_lvl)
+        lvl = if_else(naics == "10", "0", lvl)
       ),
-    by = c("year", "area_fips", "ind_code", "own_code", "ind_lvl"),
+    by = c("year", "area_id", "naics", "own_code", "lvl"),
     suffix = c("ws", "p")
   ) |>
   mutate(
     area = if_else(
-      area_fips == "08000",
+      area_id == "08000",
       "co",
-      paste0("c", str_sub(area_fips, -3))
+      paste0("c", str_sub(area_id, -3))
     ),
     area_lvl = if_else(
-      area_fips == "08000",
+      area_id == "08000",
       "state",
       "county"
     ),
@@ -1299,12 +415,13 @@ series_c <- qcew$data |>
       starts_with(c("ws", "inc", "prop", "firmws", "largest_firm")),
       \(x) replace_na(x, 0)
     ),
-    jobs = ws + prop + ag_jobs,
+    jobs = ws + prop,
+    #  + ag_jobs,
     inc = incws + incp,
     firms = firmws + prop
   ) |>
   # select(-ag_jobs) |>
-  relocate(area, .after = area_fips) %>%
+  relocate(area, .after = area_id) %>%
   # add consolidate 0 ownership code series
   bind_rows(
     . |>
@@ -1323,23 +440,23 @@ series_c <- qcew$data |>
         ),
         .by = c(
           "year",
-          "area_fips",
+          "area_id",
           "area",
           "area_lvl",
-          "ind_code",
+          "naics",
           "own_code",
-          "ind_lvl"
+          "lvl"
         )
       )
   ) |>
   relocate(starts_with("f_"), .after = last_col()) |>
-  arrange(year, area_fips, ind_code, own_code)
+  arrange(year, area_id, naics, own_code)
 
 # create combined series for Regions
 fcst$tej$series_r <- fcst$tej$series_c |>
-  mutate(county_fips = str_sub(area_fips, -3)) |>
+  mutate(county_fips = str_sub(area_id, -3)) |>
   inner_join(
-    crosswalks$region_tbl |>
+    xwalk_region_tbl |>
       filter(region <= 14) |>
       select(
         county_fips,
@@ -1347,7 +464,7 @@ fcst$tej$series_r <- fcst$tej$series_c |>
       )
   ) |>
   mutate(
-    area_fips = paste0("08", region_code),
+    area_id = paste0("08", region_code),
     area_lvl = "region",
     area = paste0("r", region_code)
   ) |>
@@ -1362,15 +479,15 @@ fcst$tej$series_r <- fcst$tej$series_c |>
     ),
     .by = c(
       "year",
-      "area_fips",
+      "area_id",
       "area",
       "area_lvl",
-      "ind_code",
+      "naics",
       "own_code",
-      "ind_lvl"
+      "lvl"
     )
   ) |>
-  arrange(year, area_fips, ind_code, own_code)
+  arrange(year, area_id, naics, own_code)
 
 # create combined series for Colorado
 fcst$tej$series <- bind_rows(
@@ -1385,7 +502,7 @@ dbWriteTable(
   overwrite = TRUE
 )
 
-dbDisconnect(qcew_con)
+dbDisconnect(conn$qcew)
 dbDisconnect(conn$qcew)
 
 ```
@@ -1400,7 +517,7 @@ Data next has to be prepared for forecasting in Eviews. This is done at the 2 di
 #| label: prepare_total_jobs
 
 # load jobs crosswalk from csv
-crosswalks$jobs <- sdodemog::pull_db_table("xwalk", "forecast_jobs")
+xwalk_jobs <- sdodemog::pull_db_table("xwalk", "forecast_jobs")
 
 fcst$tej$output <- fcst$tej$series |>
   select(
@@ -1413,14 +530,14 @@ fcst$tej$output <- fcst$tej$series |>
   ) |>
   mutate(
     naics = if_else(
-      own_code %in% c("1", "2", "3", "8") & ind_lvl == "4",
+      own_code %in% c("1", "2", "3", "8") & lvl == "4",
       "100",
-      ind_code
+      naics
     ),
-    .after = ind_code
+    .after = naics
   ) |>
   inner_join(
-    crosswalks$jobs |>
+    xwalk_jobs |>
       select(
         naics,
         own_code,
@@ -1446,9 +563,9 @@ fcst$tej$output <- fcst$tej$series |>
   ) |>
   summarize(
     value = sum(value, na.rm = TRUE),
-    .by = c(year, area_fips, area_lvl, var, naics) #, naics, own_code, ind_lvl, var)
+    .by = c(year, area_id, area_lvl, var, naics) #, naics, own_code, lvl, var)
   ) |>
-  arrange(year, area_fips, naics) |>
+  arrange(year, area_id, naics) |>
   pivot_wider(
     names_from = "year",
     values_from = "value"
@@ -1491,7 +608,7 @@ get_moodys_token()
 check_moodys_token()
 
 # pull list of moody's variables from the crosswalk to pipe into pull
-fcst$vars$jobs <- crosswalks$jobs |>
+fcst$vars$jobs <- xwalk_jobs |>
   pull(mnemonic)
 
 
@@ -1534,7 +651,7 @@ sdo_db_write_table(
 
 fcst$moodysjobs$data <- pull_db_table(schema = "forecast", table = "moodys") |>
   inner_join(
-    crosswalks$jobs |>
+    xwalk_jobs |>
       filter(
         !is.na(ind)
       ) |>
@@ -1577,10 +694,10 @@ drive_put(
 ```{r}
 # | label: load_moodys_other
 
-crosswalks$moodys <- pull_db_table("xwalk", "forecast_moodys")
+xwalk_moodys <- pull_db_table("xwalk", "forecast_moodys")
 
 # pull list of moody's variables from the crosswalk to pipe into pull
-fcst$vars$moodys <- crosswalks$moodys |>
+fcst$vars$moodys <- xwalk_moodys |>
   pull(mnemonic)
 
 
@@ -1612,7 +729,7 @@ sdo_db_write_table(
 
 fcst$moodys$data <- fcst$moodys$raw |>
   inner_join(
-    crosswalks$moodys |>
+    xwalk_moodys |>
       select(
         mnemonic,
         var
@@ -1654,13 +771,13 @@ A number of additional economic (non direct jobs) variables are used in the fore
 # | label: load_fred_data
 
 # load fred crosswalk from csv
-crosswalks$fred <- read_csv(
+xwalk_fred <- read_csv(
   "data/crosswalks/xwalk_fred.csv"
 )
 
 # create laus crosswalk
-crosswalks$fred_laus <- expand_grid(
-  county_fips = unique(crosswalks$region_tbl$county_fips),
+xwalk_fred_laus <- expand_grid(
+  county_fips = unique(xwalk_region_tbl$county_fips),
   fred_id_num = as.character(3:5)
 ) |>
   left_join(
@@ -1681,7 +798,7 @@ crosswalks$fred_laus <- expand_grid(
   arrange(county_fips, fred_id_num)
 
 # pull variables from crosswalk to pipe into pull
-fcst$fred$raw <- crosswalks$fred |>
+fcst$fred$raw <- xwalk_fred |>
   pmap(
     \(fred_series, var) {
       fredr(
@@ -1700,7 +817,7 @@ fcst$fred$raw <- crosswalks$fred |>
 fcst <- list()
 
 # download county level laus data
-# fcst$fred$raw_laus <- crosswalks$fred_laus |>
+# fcst$fred$raw_laus <- xwalk_fred_laus |>
 #   filter(
 #     county_fips != "014" # exclude Broomfield as it does not have its own series
 #   ) |>

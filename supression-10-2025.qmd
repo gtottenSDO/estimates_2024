@@ -146,9 +146,9 @@ sdo_db_write_table(
   schema = "econ",
   table = "jobs_estimates",
   vintage = "2024",
-  version = "v4",
+  # version = "v4",
   latest = TRUE,
-  overwrite = TRUE
+  overwrite = FALSE
 )
 
 dbDisconnect(con)
