@@ -62,7 +62,6 @@ The `duckdb` package is used to create a local DuckDB connection to the SDO inte
 # create connections list
 conn <- list()
 
-
 # connect to SDO Postgres database
 conn$pgsdo <- sdodemog::connect_to_sdo_db()
 
@@ -70,7 +69,15 @@ conn$pgsdo <- sdodemog::connect_to_sdo_db()
 conn$qcew <- dbConnect(
   duckdb::duckdb(),
   # storage location for duckdb database of all QCEW data - internal - change directory as needed - recommenced to save file down prior to running
-  dbdir = if (interactive()) file.choose() else "G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db",
+  dbdir = if (
+    file.exists(
+      "G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db"
+    )
+  ) {
+    "G:/Shared drives/SDO File Storage/data_resources/qcew/microdata/qcew.db"
+  } else {
+    file.choose()
+  },
   read_only = TRUE
 )
 
@@ -94,13 +101,7 @@ files$gdrive_folder <- "1bbsGG8Hwf8ZGEryFlyM-CTCfEQPfYyki"
 #| label: load_crosswalks
 
 # store crosswalk_region
-xwalk_region <- tbl(
-  conn$pgsdo,
-  sql("SELECT * FROM econ.crosswalk_region")
-)
-
-xwalk_region_tbl <- xwalk_region |>
-  collect()
+xwalk_region_pm <- pull_db_table("xwalk", "area_pm")
 
 
 # read in naics hierarchy crosswalk from excel file
@@ -125,12 +126,12 @@ The processed data included in this database has not yet been supressed and so *
 ``` {r}
 #| label: process_qcew
 
-qcew_data <- tbl(conn$qcew, "qcew_views.estimates_emp") |> 
+qcew_data <- tbl(conn$qcew, "qcew_views.estimates_emp") |>
   rename(ws = employment)
 
 # Check to make sure there are not duplicate records for any year, area_id, and naics combinations
-qcew_data |> 
-  count(year, area_id, naics) |> 
+qcew_data |>
+  count(year, area_id, naics) |>
   filter(n > 1)
 
 # create list of wage and salary job changes to use to advance jobs by one year based on pct change
@@ -144,7 +145,7 @@ qcew_changes <- qcew_data |>
     naics,
     ws
   ) |>
-  arrange(year, area_id, naics) |>
+  window_order(year, area_id, naics) |>
   group_by(area_id, naics) |>
   mutate(
     area_id = paste0("08", area_id),
@@ -153,23 +154,25 @@ qcew_changes <- qcew_data |>
     ws_change = if_else(is.na(ws_change), 0, ws_change)
   ) |>
   ungroup() |>
-  select(-ws)
+  select(-ws) |>
+  as_duckdb_tibble()
 
 ```
 
 # Sole Proprietors
 
-
-Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(nes$yrs$raw)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code. The NAICS code is renamed to `naics`[^2] to match the QCEW data, and use the `own_code` of `1` to indicate sole proprietors. The NES data is then stored in the DuckDB database for further analysis.
-
-[^2]: As there are not strict concordances between NAICS years we leave these classified as they were at the time - as with the QCEW. At the industry level there should be minimal changes. The one exception to align with the QCEW is that the QCEW utilizes 2002 NAICS codes for all years prior to . 1997 to 2002 concordances were used, allocating evenly.
-
 ```{r}
 #| label: load_nes
 
-
+nes_raw <- pull_db_table("econ", "estimates_prop") |>
+  mutate(across(where(bit64::is.integer64), as.numeric)) |> # convert int64 to numeric for compatibility with duckdb
+  as_duckdb_tibble()
 
 ```
+
+Sole proprietor estimates are derived from the U.S. Census Bureau's [Nonemployer Statistics (NES)](https://www.census.gov/programs-surveys/nonemployer-statistics.html) data, which provides an estimate of the number of sole proprietors by county and NAICS. Data is access using the [NES API](https://www.census.gov/data/developers/data-sets/nonemp-api.html). The NES data is released with a lag, and as of the current analysis the most recent available year is `{r} max(nes$year)`. The data is retrieved using the [`censusapi`](https://www.hrecht.com/censusapi/) package, which provides a convenient interface to the Census API. The NES data is processed to create a table of sole proprietors by county and NAICS code. The NAICS code is renamed to `naics`[^2] to match the QCEW data, and use the `own_code` of `1` to indicate sole proprietors. The NES data is then stored in the Postgres database where it is aggregated to the region level and the consolidated proprietor estimates are available as `econ.estimates_prop`.
+
+[^2]: As there are not strict concordances between NAICS years we leave these classified as they were at the time - as with the QCEW. At the industry level there should be minimal changes. The one exception to align with the QCEW is that the QCEW utilizes 2002 NAICS codes for all years prior to . 1997 to 2002 concordances were used, allocating evenly.
 
 # Additional Series
 
@@ -195,7 +198,6 @@ Data is pulled to get the total number of farm owners, and total farm related em
 #   prudence = "lavish"
 # ) |>
 #   filter(STATE_ALPHA == "CO")
-
 
 # ag_prop <- census_of_ag |>
 #   filter(
@@ -225,7 +227,6 @@ Data is pulled to get the total number of farm owners, and total farm related em
 #         "PRODUCERS, PRIMARY OCCUPATION, FARMING - NUMBER OF PRODUCERS"),
 #     !is.na(COUNTY_CODE)
 #   )
-
 
 # ag_ws <- census_of_ag |>
 #   filter(
@@ -328,43 +329,42 @@ Next the QCEW data is joined with the NES data to create a combined table of emp
 #| label: create_combined_series
 
 # advance proprietor jobs by one year for most recent missing year based on pct change in wage and salary jobs if there is an equivalent industry - otherwise use the last year available
-nes$data <- nes$data %>%
-  # filter(year != max(year)) %>%
+nes_most_recent <- nes_raw |>
+  filter(
+    naics != "10",
+  ) |>
+  filter(year == max(year)) |>
+  mutate(
+    year = year + 1
+  ) |>
+  left_join(
+    as_duckdb_tibble(qcew_changes),
+    by = c("area_id", "naics", "year")
+  ) |>
+  mutate(
+    prop = prop * (1 + replace_na(ws_change, 0)),
+    inc = inc * (1 + replace_na(ws_change, 0))
+  ) %>%
   bind_rows(
     . |>
       filter(
-        naics != "10",
+        lvl == "2"
       ) |>
-      filter(year == max(year)) |>
-      mutate(
-        year = year + 1
-      ) |>
-      left_join(
-        qcew_changes,
-        by = c("area_id", "naics", "own_code", "year")
-      ) |>
-      mutate(
-        prop = prop * (1 + replace_na(ws_change, 0)),
-        inc = inc * (1 + replace_na(ws_change, 0))
-      ) %>%
-      bind_rows(
-        . |> 
-          filter(
-            lvl == "2"
-          ) |> 
-          summarize(
-          naics = "10",
-          lvl = "0",
-          prop = sum(prop, na.rm = TRUE),
-          inc = sum(inc, na.rm = TRUE),
-          .by = c(year, area_id, own_code)
-        )
-      ) |>
-      select(-ws_change)
-  )
+      summarize(
+        naics = "10",
+        lvl = "0",
+        prop = sum(prop, na.rm = TRUE),
+        inc = sum(inc, na.rm = TRUE),
+        .by = c(year, area_id, area_type)
+      )
+  ) |>
+  select(-ws_change)
+
+nes_data <- nes_raw |>
+  bind_rows(nes_most_recent)
 
 # create combined series of QCEW and NES data for counties
-fcst$tej$series_c <- qcew_data |>
+total_est_jobs <- qcew_data |>
   relocate(lvl, .after = naics) |>
   # add on ag data
   # left_join(
@@ -379,38 +379,37 @@ fcst$tej$series_c <- qcew_data |>
   #   )
   # ) |>
   mutate(
-    area_id = paste0("08", area_id),
-    own_code = str_sub(own_code, 1, 1),
+    # area_id = paste0("08", area_id),
+    # own_code = str_sub(own_code, 1, 1),
     naics = if_else(naics == "00", "10", naics),
     lvl = if_else(naics == "10", "0", as.character(lvl))
   ) |>
-  rename(firmws = total_firms) |>
-  filter(
-    own_code %in%
-      c("1", "2", "3", "5") &
-      year >= 2000 &
-      lvl %in% c("0", "2", "3")
+  rename(
+    firmws = total_firms,
+    incws = wages
   ) |>
+  collect() |>
   full_join(
-    nes$data |>
-      filter((prop + inc) > 0) |>
+    nes_data |>
+      filter(
+        (prop + inc) > 0,
+        year %in% pull(distinct(qcew_data, year))
+      ) |>
       mutate(
         lvl = if_else(naics == "10", "0", lvl)
+      ) |>
+      rename(
+        incp = inc
       ),
-    by = c("year", "area_id", "naics", "own_code", "lvl"),
+    by = c("year", "area_id", "area_type", "naics", "lvl"),
     suffix = c("ws", "p")
   ) |>
   mutate(
-    area = if_else(
-      area_id == "08000",
-      "co",
-      paste0("c", str_sub(area_id, -3))
-    ),
-    area_lvl = if_else(
-      area_id == "08000",
-      "state",
-      "county"
-    ),
+    # area = if_else(
+    #   area_id == "000",
+    #   "co",
+    #   paste0("c", str_sub(area_id, -3))
+    # ),
     across(
       starts_with(c("ws", "inc", "prop", "firmws", "largest_firm")),
       \(x) replace_na(x, 0)
@@ -421,89 +420,62 @@ fcst$tej$series_c <- qcew_data |>
     firms = firmws + prop
   ) |>
   # select(-ag_jobs) |>
-  relocate(area, .after = area_id) %>%
-  # add consolidate 0 ownership code series
-  bind_rows(
-    . |>
-      # filter((agglvl_code%%10) %in% c(0, 3:5)) |>
-      mutate(
-        own_code = "0"
-      ) |>
-      summarize(
-        across(
-          starts_with(c("jobs", "ws", "inc", "prop", "firmws", "firms")),
-          ~ sum(.x, na.rm = FALSE)
-        ),
-        across(
-          starts_with("largest_firm"),
-          ~ max(.x, na.rm = TRUE)
-        ),
-        .by = c(
-          "year",
-          "area_id",
-          "area",
-          "area_lvl",
-          "naics",
-          "own_code",
-          "lvl"
-        )
-      )
-  ) |>
+  # relocate(area, .after = area_id) |>
   relocate(starts_with("f_"), .after = last_col()) |>
-  arrange(year, area_id, naics, own_code)
+  arrange(year, area_id, naics) |>
+  collect()
 
-# create combined series for Regions
-fcst$tej$series_r <- fcst$tej$series_c |>
-  mutate(county_fips = str_sub(area_id, -3)) |>
-  inner_join(
-    xwalk_region_tbl |>
-      filter(region <= 14) |>
-      select(
-        county_fips,
-        region_code
-      )
-  ) |>
+# # create combined series for Regions
+# total_est_jobs_region <- xwalk_region_pm |>
+#   inner_join(
+#     total_est_jobs_county |>
+#   select(-area_type) |>
+#   rename(county_fips = area_id),
+#     by = c("county_fips")
+#   ) |>
+#   summarize(
+#     across(
+#       starts_with(c("jobs", "ws", "inc", "prop", "firm")),
+#       ~ sum(.x, na.rm = TRUE)
+#     ),
+#     across(
+#       starts_with("largest_firm"),
+#       ~ max(.x, na.rm = TRUE)
+#     ),
+#     .by = c(
+#       "year",
+#       "area_id",
+#       # "area",
+#       "area_type",
+#       "naics",
+#       "lvl"
+#     )
+#   ) |>
+#   arrange(year, area_id, naics, lvl)
+
+```
+
+``` {r}
+
+# dbWriteTable(
+#   conn$qcew,
+#   "total_estimated_jobs",
+#   total_est_jobs,
+#   overwrite = TRUE
+# )
+
+# dbDisconnect(conn$qcew)
+
+```
+
+``` {r}
+# compare to prior version
+total_est_jobs_prior <- read_csv("data/total_estimated_jobs.csv")
+
+tej_compare <- total_est_jobs_prior |>
   mutate(
-    area_id = paste0("08", region_code),
-    area_lvl = "region",
-    area = paste0("r", region_code)
-  ) |>
-  summarize(
-    across(
-      starts_with(c("jobs", "ws", "inc", "prop", "firm")),
-      ~ sum(.x, na.rm = TRUE)
-    ),
-    across(
-      starts_with("largest_firm"),
-      ~ max(.x, na.rm = TRUE)
-    ),
-    .by = c(
-      "year",
-      "area_id",
-      "area",
-      "area_lvl",
-      "naics",
-      "own_code",
-      "lvl"
-    )
-  ) |>
-  arrange(year, area_id, naics, own_code)
-
-# create combined series for Colorado
-fcst$tej$series <- bind_rows(
-  fcst$tej$series_c,
-  fcst$tej$series_r
-)
-
-dbWriteTable(
-  conn$qcew,
-  "total_estimated_jobs",
-  fcst$tej$series,
-  overwrite = TRUE
-)
-
-dbDisconnect(conn$qcew)
-dbDisconnect(conn$qcew)
+    county_fips = str_sub(area_id, -3)
+  )
 
 ```
 

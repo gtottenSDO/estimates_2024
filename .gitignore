@@ -2,6 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+.vdoc*
 *.Rproj
 data/qcew_raw/zip
 data/qcew_raw/csv
